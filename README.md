@@ -98,6 +98,10 @@ hipSOLVER / hipSPARSE in place of cuBLAS / cuSOLVER / cuSPARSE. May have to add
 `-DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++` to allow the build to find the
 HIP compiler. The target GPU architecture can be specified with e.g.
 `-DCMAKE_HIP_ARCHITECTURES=gfx90a`, and defaults to `gfx90a` when unset.
+```
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DUSE_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx90a -DBASPACHO_USE_BLAS=ON -DBLA_VENDOR=OpenBLAS -DCMAKE_PREFIX_PATH=/opt/rocm
+```
+If the ROCm install is not on the default search path, point `-DCMAKE_PREFIX_PATH` at it (e.g. `/opt/rocm`) so CMake's `find_package` can locate hipBLAS / hipSOLVER / hipSPARSE.
 
 ### Blas
 The library used is specified in the CMake variable BLA_VENDOR,
