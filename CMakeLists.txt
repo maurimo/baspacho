@@ -40,12 +40,9 @@ set(BASPACHO_CUDA_ARCHS "detect" CACHE STRING "List of cuda architecture (eg '60
 if(USE_HIP)
   # HIP/ROCm build
   message("${Cyan}===============================[ HIP ]==================================${ColourReset}")
+  # enable_language(HIP) auto-detects the host GPU arch (and errors on a
+  # no-GPU build host); pass -DCMAKE_HIP_ARCHITECTURES=... to override.
   enable_language(HIP)
-
-  # Default HIP architecture if not specified
-  if(NOT DEFINED CMAKE_HIP_ARCHITECTURES OR CMAKE_HIP_ARCHITECTURES STREQUAL "")
-    set(CMAKE_HIP_ARCHITECTURES "gfx90a")
-  endif()
   message("* HIP architectures: ${CMAKE_HIP_ARCHITECTURES}")
 
   # Find ROCm libraries
