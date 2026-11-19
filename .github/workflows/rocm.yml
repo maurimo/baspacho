@@ -38,7 +38,7 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             git ca-certificates cmake ninja-build g++ libopenblas-dev \
             hipblas-dev hipsolver-dev hipsparse-dev rocblas-dev rocsolver-dev
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Configure
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DUSE_HIP=ON \
