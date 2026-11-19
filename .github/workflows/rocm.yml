@@ -1,0 +1,54 @@
+name: ROCm
+
+on:
+  push:
+    branches: [main, "mau/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_GENERATOR: Ninja
+
+jobs:
+  # HIP/ROCm: GitHub-hosted runners have no AMD GPU, so this checks that the
+  # HIP build (library, tests, benchmarks) compiles for CDNA and RDNA targets
+  # with the ROCm toolchain, and runs the CPU tests of that build. Running the
+  # GPU tests requires a self-hosted runner with an AMD GPU.
+  rocm-build:
+    name: ROCm ${{ matrix.rocm }} build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container: rocm/dev-ubuntu-24.04:${{ matrix.rocm }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm: ["6.4.4", "7.2.4"]
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates cmake ninja-build g++ libopenblas-dev \
+            hipblas-dev hipsolver-dev hipsparse-dev rocblas-dev rocsolver-dev
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DUSE_HIP=ON \
+            -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ \
+            "-DCMAKE_HIP_ARCHITECTURES=gfx90a;gfx942;gfx1100;gfx1201" \
+            -DCMAKE_PREFIX_PATH=/opt/rocm
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Run CPU-only tests
+        uses: ./.github/actions/ctest
+        with:
+          label: ctest ROCm ${{ matrix.rocm }} build (CPU tests only)
+          args: -E "Cuda" -j"$(nproc)"
