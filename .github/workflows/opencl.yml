@@ -29,8 +29,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { cc: gcc, cxx: g++ }
-          - { cc: clang, cxx: clang++ }
+          - { cc: gcc, cxx: g++, extra: "" }
+          # cmake/BundleStaticLibrary.cmake requires an `llvm-ar` for Clang; GNU ar works too
+          - { cc: clang-18, cxx: clang++-18, extra: "-DLLVM_AR=/usr/bin/ar" }
     env:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
@@ -48,7 +49,7 @@ jobs:
       - name: Configure
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBASPACHO_USE_CUBLAS=OFF \
-            -DBASPACHO_USE_OPENCL=ON -DBASPACHO_BUILD_EXAMPLES=OFF
+            -DBASPACHO_USE_OPENCL=ON -DBASPACHO_BUILD_EXAMPLES=OFF ${{ matrix.extra }}
       - name: Build
         run: cmake --build build -j"$(nproc)"
       - name: Test (CPU)
