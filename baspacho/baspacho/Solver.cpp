@@ -578,6 +578,16 @@ void Solver::enableStats(bool enable) {
   symCtx->trsmStat.enabled = enable;
   symCtx->sygeStat.enabled = enable;
   symCtx->asmblStat.enabled = enable;
+  symCtx->solveSparseLStat.enabled = enable;
+  symCtx->solveSparseLtStat.enabled = enable;
+  symCtx->pseudoFactorStat.enabled = enable;
+  symCtx->symmStat.enabled = enable;
+  symCtx->solveLStat.enabled = enable;
+  symCtx->solveLtStat.enabled = enable;
+  symCtx->solveGemvStat.enabled = enable;
+  symCtx->solveGemvTStat.enabled = enable;
+  symCtx->solveAssVStat.enabled = enable;
+  symCtx->solveAssVTStat.enabled = enable;
 }
 
 void Solver::resetStats() {
@@ -591,6 +601,16 @@ void Solver::resetStats() {
   symCtx->gemmCalls = 0;
   symCtx->sygeStat.reset();
   symCtx->asmblStat.reset();
+  symCtx->solveSparseLStat.reset();
+  symCtx->solveSparseLtStat.reset();
+  symCtx->pseudoFactorStat.reset();
+  symCtx->symmStat.reset();
+  symCtx->solveLStat.reset();
+  symCtx->solveLtStat.reset();
+  symCtx->solveGemvStat.reset();
+  symCtx->solveGemvTStat.reset();
+  symCtx->solveAssVStat.reset();
+  symCtx->solveAssVTStat.reset();
 }
 
 OpsPtr getBackend(const Settings& settings) {
