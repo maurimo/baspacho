@@ -6,6 +6,7 @@
  */
 
 #include "baspacho/baspacho/CoalescedBlockMatrix.h"
+#include <dispenso/parallel_for.h>
 #include <iostream>
 #include "baspacho/baspacho/DebugMacros.h"
 #include "baspacho/baspacho/Utils.h"
@@ -48,57 +49,85 @@ CoalescedBlockMatrixSkel::CoalescedBlockMatrixSkel(const vector<int64_t>& spanSt
   }
   spanOffsetInLump[numSpans] = 0;
 
-  chainColPtr.resize(numLumps + 1);
-  chainRowSpan.clear();
-  chainData.clear();
+  // Two passes, parallel on lumps: first compute per-lump sizes (number of chains,
+  // data size, number of boards), then after prefix sums fill all arrays.
+  BASPACHO_CHECK_EQ(colPtr[0], 0);
+  int64_t numChains = colPtr[numLumps];
+  BASPACHO_CHECK_EQ(numChains, (int64_t)rowInd.size());
+  chainColPtr.assign(colPtr.begin(), colPtr.end());
+  chainRowSpan.assign(rowInd.begin(), rowInd.end());
+  chainData.resize(numChains + 1);
+  chainRowsTillEnd.resize(numChains);
+  boardColPtr.assign(numLumps + 1, 0);
+  vector<int64_t> lumpDataSize(numLumps + 1, 0);
 
-  boardColPtr.resize(numLumps + 1);
-  boardRowLump.clear();
-  boardChainColOrd.clear();
-  int64_t dataPtr = 0;
-  for (int64_t l = 0; l < numLumps; l++) {
-    int64_t colStart = colPtr[l];
-    int64_t colEnd = colPtr[l + 1];
-    BASPACHO_CHECK(isStrictlyIncreasing(rowInd, colStart, colEnd));
-    int64_t lSpanBegin = lumpToSpan[l];
-    int64_t lSpanEnd = lumpToSpan[l + 1];
-    int64_t lSpanSize = lSpanEnd - lSpanBegin;
-    int64_t lDataSize = lumpStart[l + 1] - lumpStart[l];
+  constexpr int64_t kLumpChunk = 256;
+  dispenso::parallel_for(
+      dispenso::makeChunkedRange(0L, numLumps, kLumpChunk), [&](int64_t l0, int64_t l1) {
+        for (int64_t l = l0; l < l1; l++) {
+          int64_t colStart = colPtr[l];
+          int64_t colEnd = colPtr[l + 1];
+          BASPACHO_CHECK(isStrictlyIncreasing(rowInd, colStart, colEnd));
+          int64_t lSpanBegin = lumpToSpan[l];
+          int64_t lSpanEnd = lumpToSpan[l + 1];
+          int64_t lSpanSize = lSpanEnd - lSpanBegin;
 
-    // check the initial section is the set of params from `a`, and
-    // therefore the full diagonal block is contained in the matrix
-    // Column must contain full diagonal block:
-    BASPACHO_CHECK_GE(colEnd - colStart, lSpanSize);
-    // Column data must start at diagonal block:
-    BASPACHO_CHECK_EQ(rowInd[colStart], lSpanBegin);
-    // Column must contain full diagonal block:
-    BASPACHO_CHECK_EQ(rowInd[colStart + lSpanSize - 1], lSpanEnd - 1);
+          // check the initial section is the set of params from `a`, and
+          // therefore the full diagonal block is contained in the matrix
+          // Column must contain full diagonal block:
+          BASPACHO_CHECK_GE(colEnd - colStart, lSpanSize);
+          // Column data must start at diagonal block:
+          BASPACHO_CHECK_EQ(rowInd[colStart], lSpanBegin);
+          // Column must contain full diagonal block:
+          BASPACHO_CHECK_EQ(rowInd[colStart + lSpanSize - 1], lSpanEnd - 1);
 
-    chainColPtr[l] = chainRowSpan.size();
-    boardColPtr[l] = boardRowLump.size();
-    int64_t currentRowAggreg = kInvalid;
-    int64_t numRowsSkipped = 0;
-    for (int64_t i = colStart; i < colEnd; i++) {
-      int64_t p = rowInd[i];
-      chainRowSpan.push_back(p);
-      chainData.push_back(dataPtr);
-      dataPtr += lDataSize * (spanStart[p + 1] - spanStart[p]);
-      numRowsSkipped += spanStart[p + 1] - spanStart[p];
-      chainRowsTillEnd.push_back(numRowsSkipped);
+          int64_t numRows = 0, numBoards = 0, currentRowLump = kInvalid;
+          for (int64_t i = colStart; i < colEnd; i++) {
+            int64_t p = rowInd[i];
+            numRows += spanStart[p + 1] - spanStart[p];
+            chainRowsTillEnd[i] = numRows;
+            int64_t rowLump = spanToLump[p];
+            if (rowLump != currentRowLump) {
+              currentRowLump = rowLump;
+              numBoards++;
+            }
+          }
+          lumpDataSize[l] = numRows * (lumpStart[l + 1] - lumpStart[l]);
+          boardColPtr[l] = numBoards + 1;  // + end marker
+        }
+      });
+  cumSumVec(lumpDataSize);
+  int64_t totNumBoards = cumSumVec(boardColPtr);
+  boardRowLump.resize(totNumBoards);
+  boardChainColOrd.resize(totNumBoards);
 
-      int64_t rowAggreg = spanToLump[p];
-      if (rowAggreg != currentRowAggreg) {
-        currentRowAggreg = rowAggreg;
-        boardRowLump.push_back(rowAggreg);
-        boardChainColOrd.push_back(i - colStart);
-      }
-    }
-    boardRowLump.push_back(kInvalid);
-    boardChainColOrd.push_back(colEnd - colStart);
-  }
-  chainColPtr[numLumps] = chainRowSpan.size();
-  boardColPtr[numLumps] = boardRowLump.size();
-  chainData.push_back(dataPtr);
+  dispenso::parallel_for(
+      dispenso::makeChunkedRange(0L, numLumps, kLumpChunk), [&](int64_t l0, int64_t l1) {
+        for (int64_t l = l0; l < l1; l++) {
+          int64_t colStart = colPtr[l];
+          int64_t colEnd = colPtr[l + 1];
+          int64_t lDataSize = lumpStart[l + 1] - lumpStart[l];
+          int64_t dataPtr = lumpDataSize[l];
+          int64_t b = boardColPtr[l];
+          int64_t currentRowLump = kInvalid;
+          for (int64_t i = colStart; i < colEnd; i++) {
+            int64_t p = rowInd[i];
+            chainData[i] = dataPtr;
+            dataPtr += lDataSize * (spanStart[p + 1] - spanStart[p]);
+            int64_t rowLump = spanToLump[p];
+            if (rowLump != currentRowLump) {
+              currentRowLump = rowLump;
+              boardRowLump[b] = rowLump;
+              boardChainColOrd[b] = i - colStart;
+              b++;
+            }
+          }
+          boardRowLump[b] = kInvalid;
+          boardChainColOrd[b] = colEnd - colStart;
+          BASPACHO_CHECK_EQ(b + 1, boardColPtr[l + 1]);
+        }
+      });
+  chainData[numChains] = lumpDataSize[numLumps];
 
   boardRowPtr.assign(numLumps + 1, 0);
   for (int64_t l = 0; l < numLumps; l++) {

@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <dispenso/parallel_for.h>
+
 #include <vector>
 #include "baspacho/baspacho/MatOps.h"
 #include "baspacho/baspacho/Utils.h"
@@ -106,9 +108,22 @@ struct CpuBaseSymbolicCtx : SymbolicCtx {
     rewindVec(elim->rowPtr);
     elim->spanRowBegin = spanRowBegin;
 
+    int64_t numRows = (int64_t)elim->rowPtr.size() - 1;
+    constexpr int64_t kChunk = 1024;
+    std::vector<int64_t> chunkMax((numRows + kChunk - 1) / kChunk, 0);
+    dispenso::parallel_for(
+        dispenso::makeChunkedRange(0L, (int64_t)chunkMax.size(), 1L), [&](int64_t c0, int64_t c1) {
+          for (int64_t c = c0; c < c1; c++) {
+            int64_t m = 0;
+            for (int64_t r = c * kChunk, rEnd = std::min(numRows, (c + 1) * kChunk); r < rEnd; r++) {
+              m = std::max(m, computeMaxBufSize(*elim, skel, r));
+            }
+            chunkMax[c] = m;
+          }
+        });
     elim->maxBufferSize = 0;
-    for (int64_t r = 0; r < (int64_t)elim->rowPtr.size() - 1; r++) {
-      elim->maxBufferSize = std::max(elim->maxBufferSize, computeMaxBufSize(*elim, skel, r));
+    for (int64_t m : chunkMax) {
+      elim->maxBufferSize = std::max(elim->maxBufferSize, m);
     }
     return SymElimCtxPtr(elim);
   }

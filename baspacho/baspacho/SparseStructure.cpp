@@ -13,6 +13,7 @@
 #include <Eigen/OrderingMethods>
 #endif
 
+#include <dispenso/parallel_for.h>
 #include <algorithm>
 #include "baspacho/baspacho/DebugMacros.h"
 #include "baspacho/baspacho/Utils.h"
@@ -161,62 +162,116 @@ SparseStructure SparseStructure::symmetricPermutation(const std::vector<int64_t>
 SparseStructure SparseStructure::addIndependentEliminationFill(int64_t elimStart, int64_t elimEnd,
                                                                bool sortIdx) const {
   int64_t ord = order();
+  BASPACHO_CHECK_LE(0, elimStart);
+  BASPACHO_CHECK_LE(elimStart, elimEnd);
+  BASPACHO_CHECK_LE(elimEnd, ord);
 
   // nothing to do, no entries are added
   if (elimEnd == ord) {
     return *this;
   }
 
-  SparseStructure tThis = transpose();
-  for (int64_t i = elimStart; i < elimEnd; i++) {  // sort subset
-    int64_t start = tThis.ptrs[i];
-    int64_t end = tThis.ptrs[i + 1];
-    std::sort(tThis.inds.begin() + start, tThis.inds.begin() + end);
-  }
-
-  SparseStructure retv;
-  retv.ptrs.reserve(ptrs.size());
-  retv.ptrs.assign(ptrs.begin(), ptrs.begin() + elimEnd + 1);
-  retv.inds.assign(inds.begin(), inds.begin() + ptrs[elimEnd]);
-
-  vector<int64_t> tags(ord, -1);  // mark added row entries
-  for (int64_t k = elimEnd; k < ord; ++k) {
-    int64_t start = ptrs[k];
-    int64_t end = ptrs[k + 1];
-    tags[k] = k;
-    retv.inds.push_back(k);
-    for (int64_t q = start; q < end; q++) {
+  // transpose of the columns in elim range, restricted to rows >= elimEnd:
+  // elimRows[elimPtrs[i - elimStart]...] are the rows having an entry in column i,
+  // sorted because rows are visited in increasing order.
+  int64_t numElim = elimEnd - elimStart;
+  vector<int64_t> elimPtrs(numElim + 1, 0);
+  for (int64_t k = elimEnd; k < ord; k++) {
+    for (int64_t q = ptrs[k], qEnd = ptrs[k + 1]; q < qEnd; q++) {
       int64_t i = inds[q];
-      if (i >= k) {
-        continue;
-      }
-      if (tags[i] != k) {
-        retv.inds.push_back(i); /* L(k,i) is nonzero */
-        tags[i] = k;
-      }
-
-      // for i in elim lump, walk rows in same column
       if (i >= elimStart && i < elimEnd) {
-        int64_t tStart = tThis.ptrs[i];
-        int64_t tEnd = tThis.ptrs[i + 1];
-        for (int64_t t = tStart; t < tEnd; t++) {
-          int64_t w = tThis.inds[t];
-          if (w >= k) {
-            break;  // tThis rows are sorted
-          }
-          if (tags[w] < k) {
-            tags[w] = k;
-            retv.inds.push_back(w); /* L(k,q) is nonzero */
-          }
-        }
+        elimPtrs[i - elimStart]++;
       }
     }
-    retv.ptrs.push_back(retv.inds.size());
   }
+  int64_t numElimEntries = cumSumVec(elimPtrs);
+  vector<int64_t> elimRows(numElimEntries);
+  for (int64_t k = elimEnd; k < ord; k++) {
+    for (int64_t q = ptrs[k], qEnd = ptrs[k + 1]; q < qEnd; q++) {
+      int64_t i = inds[q];
+      if (i >= elimStart && i < elimEnd) {
+        elimRows[elimPtrs[i - elimStart]++] = k;
+      }
+    }
+  }
+  rewindVec(elimPtrs);
 
-  if (sortIdx) {
-    retv.sortIndices();
+  // compute rows >= elimEnd in parallel, in chunks. Row k contains the original
+  // entries with column < elimEnd, followed by the union (sorted) of the original
+  // entries in [elimEnd, k] and of the fill L(k,w) for each w having a common
+  // neighbor in the elimination range.
+  int64_t numRows = ord - elimEnd;
+  int64_t numChunks = std::min<int64_t>(numRows, 256);
+  vector<vector<int64_t>> chunkInds(numChunks);
+  vector<int64_t> rowSize(numRows);
+  dispenso::parallel_for(
+      dispenso::makeChunkedRange(0L, numChunks, 1L), [&](int64_t c0, int64_t c1) {
+        vector<int64_t> tags(numRows, -1);
+        vector<int64_t> high;
+        for (int64_t c = c0; c < c1; c++) {
+          int64_t kBegin = elimEnd + numRows * c / numChunks;
+          int64_t kEnd = elimEnd + numRows * (c + 1) / numChunks;
+          auto& out = chunkInds[c];
+          for (int64_t k = kBegin; k < kEnd; k++) {
+            size_t rowBegin = out.size();
+            high.clear();
+            tags[k - elimEnd] = k;
+            high.push_back(k);
+            for (int64_t q = ptrs[k], qEnd = ptrs[k + 1]; q < qEnd; q++) {
+              int64_t i = inds[q];
+              BASPACHO_CHECK_LE(i, k);  // lower half CSR expected
+              if (i < elimEnd) {
+                out.push_back(i);
+                if (i >= elimStart) {  // walk rows of elim column i, below k
+                  for (int64_t t = elimPtrs[i - elimStart], tEnd = elimPtrs[i - elimStart + 1];
+                       t < tEnd; t++) {
+                    int64_t w = elimRows[t];
+                    if (w >= k) {
+                      break;  // sorted
+                    }
+                    if (tags[w - elimEnd] != k) {
+                      tags[w - elimEnd] = k;
+                      high.push_back(w);
+                    }
+                  }
+                }
+              } else if (tags[i - elimEnd] != k) {
+                tags[i - elimEnd] = k;
+                high.push_back(i);
+              }
+            }
+            if (sortIdx) {
+              std::sort(out.begin() + rowBegin, out.end());
+              out.erase(std::unique(out.begin() + rowBegin, out.end()), out.end());
+              std::sort(high.begin(), high.end());
+            }
+            out.insert(out.end(), high.begin(), high.end());
+            rowSize[k - elimEnd] = out.size() - rowBegin;
+          }
+        }
+      });
+
+  SparseStructure retv;
+  retv.ptrs.resize(ord + 1);
+  std::copy(ptrs.begin(), ptrs.begin() + elimEnd + 1, retv.ptrs.begin());
+  for (int64_t k = elimEnd; k < ord; k++) {
+    retv.ptrs[k + 1] = retv.ptrs[k] + rowSize[k - elimEnd];
   }
+  retv.inds.resize(retv.ptrs[ord]);
+  std::copy(inds.begin(), inds.begin() + ptrs[elimEnd], retv.inds.begin());
+  if (sortIdx) {
+    for (int64_t k = 0; k < elimEnd; k++) {
+      std::sort(retv.inds.begin() + retv.ptrs[k], retv.inds.begin() + retv.ptrs[k + 1]);
+    }
+  }
+  dispenso::parallel_for(dispenso::makeChunkedRange(0L, numChunks, 1L),
+                         [&](int64_t c0, int64_t c1) {
+                           for (int64_t c = c0; c < c1; c++) {
+                             int64_t kBegin = elimEnd + numRows * c / numChunks;
+                             std::copy(chunkInds[c].begin(), chunkInds[c].end(),
+                                       retv.inds.begin() + retv.ptrs[kBegin]);
+                           }
+                         });
 
   return retv;
 }
@@ -331,7 +386,7 @@ std::vector<int64_t> SparseStructure::fillReducingPermutation() const {
 
 #endif
 
-SparseStructure SparseStructure::extractRightBottom(int64_t startRow) {
+SparseStructure SparseStructure::extractRightBottom(int64_t startRow) const {
   int64_t ord = order();
   BASPACHO_CHECK_LE(startRow, ord);
   BASPACHO_CHECK_GE(startRow, 0);

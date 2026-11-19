@@ -63,7 +63,6 @@ struct EliminationTree {
   std::vector<int64_t> nodeSize;
   std::vector<int64_t> nodeRows;
   std::vector<int64_t> nodeRowBlocks;
-  std::vector<std::vector<int64_t>> perColNodes;
   struct NodeStats {
     int64_t colIdx;
     int64_t rBlocks;
