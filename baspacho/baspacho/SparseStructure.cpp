@@ -355,7 +355,7 @@ SparseStructure SparseStructure::extractRightBottom(int64_t startRow) {
   int64_t tot = cumSumVec(retv.ptrs);
   retv.inds.resize(tot);
 
-  for (int64_t i = 0; i < ord; i++) {
+  for (int64_t i = startRow; i < ord; i++) {
     int64_t start = ptrs[i];
     int64_t end = ptrs[i + 1];
     for (int64_t k = start; k < end; k++) {

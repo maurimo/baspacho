@@ -617,6 +617,9 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   BASPACHO_CHECK((int64_t)sparseElimRanges.size() != 1);
   int64_t givenSparseElimEnd = sparseElimRanges.empty() ? 0 : sparseElimRanges.back();
   if (!sparseElimRanges.empty()) {
+    // parameters before the first range would otherwise be silently skipped by factor
+    BASPACHO_CHECK_EQ(sparseElimRanges[0], 0);
+    BASPACHO_CHECK_LE(sparseElimRanges.back(), (int64_t)paramSize.size());
     BASPACHO_CHECK(isStrictlyIncreasing(sparseElimRanges, 0, sparseElimRanges.size()));
     for (int64_t id : elimLastIds) {
       BASPACHO_CHECK_GE(id, givenSparseElimEnd);
