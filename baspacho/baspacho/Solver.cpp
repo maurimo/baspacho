@@ -21,6 +21,39 @@ using namespace std;
 using hrc = chrono::high_resolution_clock;
 using tdelta = chrono::duration<double>;
 
+namespace {
+// Optional breakdown of symbolic-analysis timings, printed to stderr when the
+// environment variable BASPACHO_ANALYSIS_TIMINGS is set.
+struct AnalysisTimer {
+  explicit AnalysisTimer(const char* label_)
+      : label(label_), on(getenv("BASPACHO_ANALYSIS_TIMINGS") != nullptr), last(hrc::now()) {}
+  void mark(const char* phase) {
+    if (!on) {
+      return;
+    }
+    auto now = hrc::now();
+    phases.emplace_back(phase, tdelta(now - last).count());
+    last = now;
+  }
+  ~AnalysisTimer() {
+    if (!on) {
+      return;
+    }
+    double tot = 0;
+    fprintf(stderr, "[%s]", label);
+    for (auto& [name, t] : phases) {
+      fprintf(stderr, " %s=%.2fms", name, t * 1e3);
+      tot += t;
+    }
+    fprintf(stderr, " total=%.2fms\n", tot * 1e3);
+  }
+  const char* label;
+  bool on;
+  hrc::time_point last;
+  std::vector<std::pair<const char*, double>> phases;
+};
+}  // namespace
+
 Solver::Solver(CoalescedBlockMatrixSkel&& factorSkel_, std::vector<int64_t>&& sparseElimRanges_,
                std::vector<int64_t>&& permutation_, OpsPtr&& ops_, int64_t canFactorUpTo_)
     : factorSkel(std::move(factorSkel_)),
@@ -31,12 +64,16 @@ Solver::Solver(CoalescedBlockMatrixSkel&& factorSkel_, std::vector<int64_t>&& sp
   if (canFactorUpTo < 0) {
     canFactorUpTo = factorSkel.numSpans();
   }
+  AnalysisTimer timer("baspacho solver-init");
   symCtx = ops->createSymbolicCtx(factorSkel, permutation);
+  timer.mark("symCtx");
   for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
     elimCtxs.push_back(symCtx->prepareElimination(sparseElimRanges[l], sparseElimRanges[l + 1]));
   }
+  timer.mark("prepElim");
 
   initElimination();
+  timer.mark("initElim");
 }
 
 template <typename T>
@@ -613,6 +650,7 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
                        const unordered_set<int64_t>& elimLastIds) {
   // no point in providing "elim last" ids if not allowing solve up to such set
   BASPACHO_CHECK(settings.addFillPolicy == AddFillComplete || elimLastIds.empty());
+  AnalysisTimer timer("baspacho analysis");
 
   BASPACHO_CHECK((int64_t)sparseElimRanges.size() != 1);
   int64_t givenSparseElimEnd = sparseElimRanges.empty() ? 0 : sparseElimRanges.back();
@@ -629,6 +667,8 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
       ss = ss.addIndependentEliminationFill(sparseElimRanges[e], sparseElimRanges[e + 1]);
     }
   }
+
+  timer.mark("elimFill");
 
   // create a factor where either no fill is added, either limited for given elims
   if (settings.addFillPolicy == AddFillNone || settings.addFillPolicy == AddFillForGivenElims) {
@@ -654,9 +694,11 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   }
 
   SparseStructure ssBottom = ss.extractRightBottom(givenSparseElimEnd);
+  timer.mark("extractBR");
 
   // find best permutation for right-bottom corner that is left
   vector<int64_t> permutation = ssBottom.fillReducingPermutation();
+  timer.mark("amd");
   vector<int64_t> noCrossPoints;
   if (!elimLastIds.empty()) {  // force those params to go last
     vector<int64_t> parts[2];
@@ -676,6 +718,8 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
     sortedBottomParamSize[invPerm[i - givenSparseElimEnd]] = paramSize[i];
   }
 
+  timer.mark("permuteBR");
+
   // auto select computation model (for node merge heuristic), if not provided
   const ComputationModel* compModel = settings.computationModel ? settings.computationModel
                                       : settings.backend == BackendCuda
@@ -684,10 +728,14 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
 
   // compute as ordinary elimination tree on br-corner
   EliminationTree et(sortedBottomParamSize, sortedSsBottom, compModel);
+  timer.mark("etInit");
   et.buildTree();
+  timer.mark("etBuild");
   et.processTree(settings.findSparseEliminationRanges, noCrossPoints,
                  settings.addFillPolicy == AddFillForAutoElims);
+  timer.mark("etProcess");
   et.computeAggregateStruct(settings.addFillPolicy == AddFillForAutoElims);
+  timer.mark("etAggregate");
 
   // ss last rows are to be permuted according to etTotalInvPerm
   vector<int64_t> etTotalInvPerm = composePermutations(et.permInverse, invPerm);
@@ -712,7 +760,9 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   BASPACHO_CHECK_EQ((int64_t)fullSpanStart.size() - 1, fullLumpToSpan.back());
 
   // matrix with blocks not joined, we will need the first columns
+  timer.mark("perms");
   SparseStructure sortedSsT = ss.symmetricPermutation(fullInvPerm, false).transpose();
+  timer.mark("permuteFull");
 
   // fullColStart joining sortedSsT.ptrs + shifted elimEndDataPtr
   vector<int64_t> fullColStart;
@@ -731,7 +781,9 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   shiftConcat(fullRowParam, givenSparseElimEnd, et.rowParam.begin(), et.rowParam.end());
   BASPACHO_CHECK_EQ((int64_t)fullRowParam.size(), fullColStart.back());
 
+  timer.mark("concat");
   CoalescedBlockMatrixSkel factorSkel(fullSpanStart, fullLumpToSpan, fullColStart, fullRowParam);
+  timer.mark("skel");
 
   // include (additional) progressive Schur elimination sets, shifted
   std::vector<int64_t> fullSparseElimRanges = sparseElimRanges;
@@ -745,10 +797,14 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   }
   int64_t fullSparseElimEnd = fullSparseElimRanges.empty() ? 0 : fullSparseElimRanges.back();
 
-  return SolverPtr(new Solver(
+  OpsPtr ops = getBackend(settings);
+  timer.mark("backend");
+  SolverPtr solver(new Solver(
       std::move(factorSkel), std::move(fullSparseElimRanges), std::move(fullInvPerm),
-      getBackend(settings),
+      std::move(ops),
       settings.addFillPolicy == AddFillForAutoElims ? fullSparseElimEnd : paramSize.size()));
+  timer.mark("solverCtor");
+  return solver;
 }
 
 }  // end namespace BaSpaCho
