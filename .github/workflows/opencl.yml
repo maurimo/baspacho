@@ -1,0 +1,64 @@
+name: OpenCL
+
+on:
+  push:
+    branches: [main, "mau/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_GENERATOR: Ninja
+
+jobs:
+  # OpenCL backend tested on PoCL (portable OpenCL implementation running on
+  # the runner's CPU), with CLBlast from the distribution. This validates
+  # correctness of the OpenCL kernels/host code, not GPU performance.
+  linux-opencl-pocl:
+    name: OpenCL on PoCL (${{ matrix.cxx }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cc: gcc, cxx: g++ }
+          - { cc: clang, cxx: clang++ }
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build libopenblas-dev \
+            opencl-headers ocl-icd-opencl-dev pocl-opencl-icd libclblast-dev clinfo
+      - name: Probe OpenCL devices
+        run: |
+          clinfo -l || true
+          echo "::notice title=OpenCL devices::$(clinfo -l 2>&1 | paste -sd' ' -)"
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBASPACHO_USE_CUBLAS=OFF \
+            -DBASPACHO_USE_OPENCL=ON -DBASPACHO_BUILD_EXAMPLES=OFF
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Test (CPU)
+        uses: ./.github/actions/ctest
+        with:
+          label: ctest CPU (OpenCL build)
+          args: -E "OpenCL" -j"$(nproc)"
+      - name: Test (OpenCL)
+        if: always()
+        uses: ./.github/actions/ctest
+        with:
+          label: ctest OpenCL/PoCL ${{ matrix.cxx }}
+          args: -R "OpenCL"
