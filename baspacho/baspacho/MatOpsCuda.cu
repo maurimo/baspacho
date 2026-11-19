@@ -38,8 +38,9 @@ using OuterStridedCMajMatK =
 // synchronization ops, Cuda version
 struct CudaSyncOps {
   static void sync() {
-    // can call 'cudaDeviceSynchronize()', but not needed
-    cuCHECK(cudaStreamSynchronize(0));
+    // can call 'cudaDeviceSynchronize()', but not needed.
+    // Called from (stat timer) destructors, therefore it must not throw
+    cuWARN(cudaStreamSynchronize(0));
   }
 };
 
@@ -77,10 +78,10 @@ struct CudaSymbolicCtx : SymbolicCtx {
 
   virtual ~CudaSymbolicCtx() override {
     if (cublasH) {
-      cublasCHECK(cublasDestroy(cublasH));
+      cublasWARN(cublasDestroy(cublasH));
     }
     if (cusolverDnH) {
-      cusolverCHECK(cusolverDnDestroy(cusolverDnH));
+      cusolverWARN(cusolverDnDestroy(cusolverDnH));
     }
   }
 
@@ -454,10 +455,14 @@ struct CudaNumericCtx : NumericCtx<T> {
 #else
     int wgs2 = 32;
     int numGroups2 = (elim.numBlockPairs + wgs2 - 1) / wgs2;
-    sparse_elim_straight_kernel<T><<<numGroups2, wgs2>>>(
-        sym.devChainColPtr.ptr, sym.devLumpStart.ptr, sym.devChainRowSpan.ptr, sym.devSpanStart.ptr,
-        sym.devChainData.ptr, sym.devSpanToLump.ptr, sym.devSpanOffsetInLump.ptr, data, lumpsBegin,
-        lumpsEnd, elim.makeBlockPairEnumStraight.ptr, elim.numBlockPairs, Plain{});
+    if (numGroups2 > 0) {  // a launch with empty grid leaves a (sticky) CUDA error
+      sparse_elim_straight_kernel<T><<<numGroups2, wgs2>>>(
+          sym.devChainColPtr.ptr, sym.devLumpStart.ptr, sym.devChainRowSpan.ptr,
+          sym.devSpanStart.ptr, sym.devChainData.ptr, sym.devSpanToLump.ptr,
+          sym.devSpanOffsetInLump.ptr, data, lumpsBegin, lumpsEnd,
+          elim.makeBlockPairEnumStraight.ptr, elim.numBlockPairs, Plain{});
+      cuCHECK(cudaPeekAtLastError());
+    }
 #endif
   }
 
@@ -631,7 +636,7 @@ struct CudaNumericCtx<vector<T*>> : NumericCtx<vector<T*>> {
     devPtrsA.load(*data, 0);
 
     int batchWgs = 32;
-    while (batchWgs / 2 >= (int)data->size()) {
+    while (batchWgs > 1 && batchWgs / 2 >= (int)data->size()) {
       batchWgs /= 2;
     }
     int batchGroups = (data->size() + batchWgs - 1) / batchWgs;
@@ -658,11 +663,15 @@ struct CudaNumericCtx<vector<T*>> : NumericCtx<vector<T*>> {
     int numGroups2 = (elim.numBlockPairs + wgs2 - 1) / wgs2;
     dim3 gridDim2(numGroups2, batchGroups);
     dim3 blockDim2(wgs2, batchWgs);
-    sparse_elim_straight_kernel<T*><<<gridDim2, blockDim2>>>(
-        sym.devChainColPtr.ptr, sym.devLumpStart.ptr, sym.devChainRowSpan.ptr, sym.devSpanStart.ptr,
-        sym.devChainData.ptr, sym.devSpanToLump.ptr, sym.devSpanOffsetInLump.ptr, devPtrsA.ptr,
-        lumpsBegin, lumpsEnd, elim.makeBlockPairEnumStraight.ptr, elim.numBlockPairs,
-        Batched{.batchSize = (int)data->size(), .batchIndex = 0});
+    if (numGroups2 > 0) {  // a launch with empty grid leaves a (sticky) CUDA error
+      sparse_elim_straight_kernel<T*><<<gridDim2, blockDim2>>>(
+          sym.devChainColPtr.ptr, sym.devLumpStart.ptr, sym.devChainRowSpan.ptr,
+          sym.devSpanStart.ptr, sym.devChainData.ptr, sym.devSpanToLump.ptr,
+          sym.devSpanOffsetInLump.ptr, devPtrsA.ptr, lumpsBegin, lumpsEnd,
+          elim.makeBlockPairEnumStraight.ptr, elim.numBlockPairs,
+          Batched{.batchSize = (int)data->size(), .batchIndex = 0});
+      cuCHECK(cudaPeekAtLastError());
+    }
 #endif
   }
 
@@ -699,7 +708,7 @@ struct CudaNumericCtx<vector<T*>> : NumericCtx<vector<T*>> {
     const int64_t* pSpanOffsetInLump = sym.devSpanOffsetInLump.ptr;
 
     int batchWgs = 32;
-    while (batchWgs / 2 >= (int)data->size()) {
+    while (batchWgs > 1 && batchWgs / 2 >= (int)data->size()) {
       batchWgs /= 2;
     }
     int batchGroups = (data->size() + batchWgs - 1) / batchWgs;
@@ -1203,7 +1212,7 @@ struct CudaSolveCtx<vector<T*>> : SolveCtx<vector<T*>> {
     devPtrsY.load(*C, 0);
 
     int batchWgs = 32;
-    while (batchWgs / 2 >= (int)C->size()) {
+    while (batchWgs > 1 && batchWgs / 2 >= (int)C->size()) {
       batchWgs /= 2;
     }
     int batchGroups = (C->size() + batchWgs - 1) / batchWgs;
@@ -1233,7 +1242,7 @@ struct CudaSolveCtx<vector<T*>> : SolveCtx<vector<T*>> {
     devPtrsY.load(*C, 0);
 
     int batchWgs = 32;
-    while (batchWgs / 2 >= (int)C->size()) {
+    while (batchWgs > 1 && batchWgs / 2 >= (int)C->size()) {
       batchWgs /= 2;
     }
     int batchGroups = (C->size() + batchWgs - 1) / batchWgs;
@@ -1268,7 +1277,7 @@ struct CudaSolveCtx<vector<T*>> : SolveCtx<vector<T*>> {
     auto timer = sym.solveAssVStat.instance<CudaSyncOps>();
     devPtrsX.load(*C, 0);
     int batchWgs = 32;
-    while (batchWgs / 2 >= (int)C->size()) {
+    while (batchWgs > 1 && batchWgs / 2 >= (int)C->size()) {
       batchWgs /= 2;
     }
     int batchGroups = (C->size() + batchWgs - 1) / batchWgs;
@@ -1293,7 +1302,7 @@ struct CudaSolveCtx<vector<T*>> : SolveCtx<vector<T*>> {
     auto timer = sym.solveAssVTStat.instance<CudaSyncOps>();
     devPtrsX.load(*C, 0);
     int batchWgs = 32;
-    while (batchWgs / 2 >= (int)C->size()) {
+    while (batchWgs > 1 && batchWgs / 2 >= (int)C->size()) {
       batchWgs /= 2;
     }
     int batchGroups = (C->size() + batchWgs - 1) / batchWgs;

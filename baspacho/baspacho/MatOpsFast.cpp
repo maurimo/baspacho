@@ -817,7 +817,7 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
         dispenso::parallel_for(
             taskSet, dispenso::makeChunkedRange(subBegin, subEnd, 4L),
             [&](int64_t rangeBegin, int64_t rangeEnd) {
-              BASPACHO_CHECK_LE(rangeBegin, rangeEnd + 4);
+              BASPACHO_CHECK_LE(rangeEnd, rangeBegin + 4);
               int64_t dataStart = skel.spanStart[rangeBegin];
               int64_t dataSize = skel.spanStart[rangeEnd] - dataStart;
               T* outData = (T*)alloca(sizeof(T) * dataSize);
