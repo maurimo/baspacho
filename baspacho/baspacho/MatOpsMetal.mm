@@ -715,7 +715,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
 
       Eigen::Map<const MatRMaj> matA(data + offset, n, n);
       OuterStridedCMajMatK matC(C + offC, n, nRHS, OuterStride(ldc));
-      OuterStridedCMajMatM matD(D, n, nRHS, OuterStride(ldd));
+      OuterStridedCMajMatM matD(D + offC, n, nRHS, OuterStride(ldd));
       matD.noalias() += alpha * (MatRMaj(matA.template selfadjointView<Eigen::Lower>()) * matC);
     }
   }
