@@ -1,0 +1,72 @@
+name: Metal
+
+on:
+  push:
+    branches: [main, "mau/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_GENERATOR: Ninja
+
+jobs:
+  # Builds the Metal backend (Objective-C++ sources + .metal shaders) and runs
+  # the whole test suite. GitHub's Apple Silicon runners are VMs exposing an
+  # "Apple Paravirtual device"; the probe step reports whether a Metal device
+  # (and MPS) is usable there, and the Metal tests run either way so that the
+  # outcome is visible.
+  macos-metal:
+    name: Metal (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: brew install ninja openblas llvm
+      - name: Probe Metal device
+        run: |
+          system_profiler SPDisplaysDataType || true
+          cat > probe.swift <<'SWIFT'
+          import Metal
+          import MetalPerformanceShaders
+          if let d = MTLCreateSystemDefaultDevice() {
+            print("device=\(d.name) unifiedMemory=\(d.hasUnifiedMemory) " +
+                  "maxThreadsPerThreadgroup=\(d.maxThreadsPerThreadgroup.width) " +
+                  "apple7=\(d.supportsFamily(.apple7)) mps=\(MPSSupportsMTLDevice(d))")
+          } else {
+            print("device=none")
+          }
+          SWIFT
+          out=$(xcrun swift probe.swift 2>&1 || true)
+          echo "$out"
+          echo "::notice title=Metal probe ${{ matrix.os }}::$(echo "$out" | tail -1)"
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBASPACHO_USE_CUBLAS=OFF \
+            -DBASPACHO_USE_METAL=ON -DBLA_VENDOR=OpenBLAS -DLLVM_AR="$(brew --prefix llvm)/bin/llvm-ar" \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix openblas)"
+      - name: Build
+        run: cmake --build build -j"$(sysctl -n hw.ncpu)"
+      - name: Test (CPU)
+        uses: ./.github/actions/ctest
+        with:
+          label: ctest CPU ${{ matrix.os }}
+          args: -E "Metal" -j"$(sysctl -n hw.ncpu)"
+      - name: Test (Metal)
+        if: always()
+        uses: ./.github/actions/ctest
+        with:
+          label: ctest Metal ${{ matrix.os }}
+          args: -R "Metal"
