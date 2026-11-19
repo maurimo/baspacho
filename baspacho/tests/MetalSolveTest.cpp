@@ -33,9 +33,8 @@ template <typename T>
 struct Epsilon;
 template <>
 struct Epsilon<float> {
-  // Metal/Apple Silicon has slightly different float precision characteristics
-  // Relaxed tolerance for sparse elim + solve operations
-  static constexpr float value = 1e-4;
+  // same tolerances as CudaSolveTest
+  static constexpr float value = 1e-5;
   static constexpr float value2 = 4e-5;
 };
 

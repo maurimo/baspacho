@@ -33,10 +33,9 @@ template <typename T>
 struct Epsilon;
 template <>
 struct Epsilon<float> {
+  // same tolerances as CudaFactorTest
   static constexpr float value = 1e-5;
-  // Metal/Apple Silicon has slightly different float precision characteristics
-  // Relaxed tolerance for complex sparse factorization (sparse elim + dense)
-  static constexpr float value2 = 3e-3;
+  static constexpr float value2 = 5e-5;
 };
 
 template <typename T>

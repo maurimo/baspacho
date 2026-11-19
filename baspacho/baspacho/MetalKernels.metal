@@ -171,18 +171,19 @@ inline void atomicAddFloat(device atomic_uint* addr, float val) {
 }
 
 // Strided matrix subtraction with atomics: A -= B * C^T
-// A is aRows x cRows, B is aRows x bCols, C is cRows x bCols (transposed)
-inline void locked_sub_product_float(device float* aMat, int aStride,
-                                     device float* bMat, int bRows, int bCols, int bStride,
-                                     device float* cMatT, int cRows, int cStride) {
-    for (int i = 0; i < bRows; i++) {
-        for (int j = 0; j < cRows; j++) {
+// A is bRows x cRows (stride aStride), B is bRows x k (stride bStride),
+// C is cRows x k (stride cStride). Same as locked_sub_product in CudaAtomic.cuh
+inline void locked_sub_product_float(device float* aMat, int64_t aStride,
+                                     device const float* bMat, int64_t bRows, int64_t bStride,
+                                     device const float* cMat, int64_t cRows, int64_t cStride,
+                                     int64_t k) {
+    for (int64_t i = 0; i < bRows; i++) {
+        for (int64_t j = 0; j < cRows; j++) {
             float val = 0.0f;
-            for (int k = 0; k < bCols; k++) {
-                val += bMat[i * bStride + k] * cMatT[j * cStride + k];
+            for (int64_t q = 0; q < k; q++) {
+                val += bMat[i * bStride + q] * cMat[j * cStride + q];
             }
-            device atomic_uint* addr = (device atomic_uint*)&aMat[i * aStride + j];
-            atomicSubFloat(addr, val);
+            atomicSubFloat((device atomic_uint*)&aMat[i * aStride + j], val);
         }
     }
 }
@@ -259,25 +260,25 @@ kernel void factor_spans_kernel_float(
 
     int64_t lump = spanToLump[span];
     int64_t spanOffInLump = spanOffsetInLump[span];
+    int64_t spanIndexInLump = span - lumpToSpan[lump];
     int64_t lumpSize = lumpStart[lump + 1] - lumpStart[lump];
     int64_t spanSize = spanStart[span + 1] - spanStart[span];
     int64_t colStart = chainColPtr[lump];
-    int64_t dataPtr = chainData[colStart];
+    int64_t dataPtr = chainData[colStart + spanIndexInLump] + spanOffInLump;
 
-    // Pointer to start of this span within the diagonal block
-    device float* spanDiagPtr = data + dataPtr + spanOffInLump * (lumpSize + 1);
+    // In-place Cholesky of the span's diagonal block
+    device float* spanDiagPtr = data + dataPtr;
     cholesky(spanDiagPtr, int(lumpSize), int(spanSize));
 
-    // Below-diagonal solve for this span
-    int64_t gatheredStart = boardColPtr[lump];
+    // Solve all rows below this span's diagonal block (the following spans of the same
+    // lump included), as in factor_spans_kernel in MatOpsCuda.cu
     int64_t gatheredEnd = boardColPtr[lump + 1];
-    int64_t rowDataStart = boardChainColOrd[gatheredStart + 1];
     int64_t rowDataEnd = boardChainColOrd[gatheredEnd - 1];
-    int64_t belowDiagStart = chainData[colStart + rowDataStart];
+    int64_t belowDiagPtr = chainData[colStart + spanIndexInLump + 1] + spanOffInLump;
     int64_t numRows = chainRowsTillEnd[colStart + rowDataEnd - 1]
-                    - chainRowsTillEnd[colStart + rowDataStart - 1];
+                    - chainRowsTillEnd[colStart + spanIndexInLump];
 
-    device float* belowDiagBlockPtr = data + belowDiagStart + spanOffInLump;
+    device float* belowDiagBlockPtr = data + belowDiagPtr;
     for (int64_t i = 0; i < numRows; i++) {
         solveUpperT_dev(spanDiagPtr, int(lumpSize), int(spanSize), belowDiagBlockPtr);
         belowDiagBlockPtr += lumpSize;
@@ -311,40 +312,35 @@ kernel void sparse_elim_straight_kernel_float(
     int64_t pos = bisect(makeBlockPairEnumStraight, lumpIndexEnd - lumpIndexStart, int64_t(tid));
     int64_t l = lumpIndexStart + pos;
 
-    // Get the number of below-diagonal blocks in this column
-    int64_t colStart = chainColPtr[l] + 1;  // skip diagonal
-    int64_t colEnd = chainColPtr[l + 1];
-    int64_t n = colEnd - colStart;
-
-    // Convert linear index to block pair (di, dj)
+    int64_t startPtr = chainColPtr[l] + 1;  // skip diagonal block
+    int64_t n = chainColPtr[l + 1] - startPtr;
     int2 di_dj = toOrderedPair(n, int64_t(tid) - makeBlockPairEnumStraight[pos]);
-    int64_t di = di_dj.x;
-    int64_t dj = di_dj.y;
+    int64_t lColSize = lumpStart[l + 1] - lumpStart[l];
 
-    // Get block information
-    int64_t lumpSize = lumpStart[l + 1] - lumpStart[l];
-    int64_t iSpan = chainRowSpan[colStart + di];
-    int64_t jSpan = chainRowSpan[colStart + dj];
-    int64_t iSize = spanStart[iSpan + 1] - spanStart[iSpan];
-    int64_t jSize = spanStart[jSpan + 1] - spanStart[jSpan];
-    int64_t iDataPtr = chainData[colStart + di];
-    int64_t jDataPtr = chainData[colStart + dj];
+    // block (si, l): siSize x lColSize, row-major
+    int64_t i = startPtr + di_dj.x;
+    int64_t si = chainRowSpan[i];
+    int64_t siSize = spanStart[si + 1] - spanStart[si];
+    device const float* ilBlock = data + chainData[i];
 
-    // Find target block in factored matrix
-    int64_t iLump = spanToLump[iSpan];
-    int64_t iSpanOff = spanOffsetInLump[iSpan];
-    int64_t jSpanOff = spanOffsetInLump[jSpan];
-    int64_t targetLumpSize = lumpStart[iLump + 1] - lumpStart[iLump];
+    // block (sj, l): sjSize x lColSize, row-major (sj >= si)
+    int64_t j = startPtr + di_dj.y;
+    int64_t sj = chainRowSpan[j];
+    int64_t sjSize = spanStart[sj + 1] - spanStart[sj];
+    device const float* jlBlock = data + chainData[j];
 
-    // Target chain lookup would go here...
-    // For now, this is a skeleton - full implementation requires chain lookup
+    // target block (sj, si) lives in the column of the lump containing si
+    int64_t targetLump = spanToLump[si];
+    int64_t targetSpanOffsetInLump = spanOffsetInLump[si];
+    int64_t targetStartPtr = chainColPtr[targetLump];
+    int64_t targetEndPtr = chainColPtr[targetLump + 1];
+    int64_t targetLumpSize = lumpStart[targetLump + 1] - lumpStart[targetLump];
+    int64_t tPos = bisect(chainRowSpan + targetStartPtr, targetEndPtr - targetStartPtr, sj);
+    device float* jiBlock = data + chainData[targetStartPtr + tPos] + targetSpanOffsetInLump;
 
-    // Perform elimination: target -= src_i * src_j^T (with atomics)
-    device float* srcI = data + iDataPtr;
-    device float* srcJ = data + jDataPtr;
-
-    // This is simplified - actual implementation needs target pointer lookup
-    // locked_sub_product(target, targetStride, srcI, iSize, lumpSize, lumpSize, srcJ, jSize, lumpSize);
+    // jiBlock -= jlBlock * ilBlock^T (atomically, several pairs hit the same target)
+    locked_sub_product_float(jiBlock, targetLumpSize, jlBlock, sjSize, lColSize,
+                             ilBlock, siSize, lColSize, lColSize);
 }
 
 // ============================================================================
@@ -551,5 +547,99 @@ kernel void sparseElim_diagSolveLt_float(
 
     for (int64_t rhs = 0; rhs < nRHS; rhs++) {
         solveUpper_dev(diagBlock, int(lumpSize), int(lumpSize), v + lumpStart + ldc * rhs);
+    }
+}
+
+// ============================================================================
+// Solve kernels: sparseElim_subDiagMult (after diagSolveL)
+// v[rows of sub-diagonal blocks] -= block * v[lump rows], one thread per lump
+// ============================================================================
+kernel void sparseElim_subDiagMult_float(
+    constant int64_t* lumpStarts [[buffer(0)]],
+    constant int64_t* spanStarts [[buffer(1)]],
+    constant int64_t* chainColPtr [[buffer(2)]],
+    constant int64_t* chainRowSpan [[buffer(3)]],
+    constant int64_t* chainData [[buffer(4)]],
+    device const float* data [[buffer(5)]],
+    device float* v [[buffer(6)]],
+    constant int64_t& ldc [[buffer(7)]],
+    constant int64_t& nRHS [[buffer(8)]],
+    constant int64_t& lumpIndexStart [[buffer(9)]],
+    constant int64_t& lumpIndexEnd [[buffer(10)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int64_t lump = lumpIndexStart + tid;
+    if (lump >= lumpIndexEnd) {
+        return;
+    }
+
+    int64_t lumpStart = lumpStarts[lump];
+    int64_t lumpSize = lumpStarts[lump + 1] - lumpStart;
+    int64_t colStart = chainColPtr[lump];
+    int64_t colEnd = chainColPtr[lump + 1];
+
+    for (int64_t colPtr = colStart + 1; colPtr < colEnd; colPtr++) {
+        int64_t rowSpan = chainRowSpan[colPtr];
+        int64_t rowSpanStart = spanStarts[rowSpan];
+        int64_t rowSpanSize = spanStarts[rowSpan + 1] - rowSpanStart;
+        device const float* block = data + chainData[colPtr];  // rowSpanSize x lumpSize
+        for (int64_t c = 0; c < nRHS; c++) {
+            device const float* x = v + lumpStart + c * ldc;
+            for (int64_t r = 0; r < rowSpanSize; r++) {
+                float val = 0.0f;
+                for (int64_t q = 0; q < lumpSize; q++) {
+                    val += block[r * lumpSize + q] * x[q];
+                }
+                atomicSubFloat((device atomic_uint*)&v[rowSpanStart + r + c * ldc], val);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Solve kernels: sparseElim_subDiagMultT (before diagSolveLt)
+// v[lump rows] -= block^T * v[rows of sub-diagonal blocks], one thread per lump
+// (each thread only writes the rows of its own lump, no atomics needed)
+// ============================================================================
+kernel void sparseElim_subDiagMultT_float(
+    constant int64_t* lumpStarts [[buffer(0)]],
+    constant int64_t* spanStarts [[buffer(1)]],
+    constant int64_t* chainColPtr [[buffer(2)]],
+    constant int64_t* chainRowSpan [[buffer(3)]],
+    constant int64_t* chainData [[buffer(4)]],
+    device const float* data [[buffer(5)]],
+    device float* v [[buffer(6)]],
+    constant int64_t& ldc [[buffer(7)]],
+    constant int64_t& nRHS [[buffer(8)]],
+    constant int64_t& lumpIndexStart [[buffer(9)]],
+    constant int64_t& lumpIndexEnd [[buffer(10)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int64_t lump = lumpIndexStart + tid;
+    if (lump >= lumpIndexEnd) {
+        return;
+    }
+
+    int64_t lumpStart = lumpStarts[lump];
+    int64_t lumpSize = lumpStarts[lump + 1] - lumpStart;
+    int64_t colStart = chainColPtr[lump];
+    int64_t colEnd = chainColPtr[lump + 1];
+
+    for (int64_t colPtr = colStart + 1; colPtr < colEnd; colPtr++) {
+        int64_t rowSpan = chainRowSpan[colPtr];
+        int64_t rowSpanStart = spanStarts[rowSpan];
+        int64_t rowSpanSize = spanStarts[rowSpan + 1] - rowSpanStart;
+        device const float* block = data + chainData[colPtr];  // rowSpanSize x lumpSize
+        for (int64_t c = 0; c < nRHS; c++) {
+            device const float* q = v + rowSpanStart + c * ldc;
+            device float* x = v + lumpStart + c * ldc;
+            for (int64_t k = 0; k < lumpSize; k++) {
+                float val = 0.0f;
+                for (int64_t r = 0; r < rowSpanSize; r++) {
+                    val += block[r * lumpSize + k] * q[r];
+                }
+                x[k] -= val;
+            }
+        }
     }
 }

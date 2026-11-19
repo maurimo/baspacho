@@ -83,7 +83,7 @@ if(BASPACHO_USE_METAL)
 
     add_custom_command(
         OUTPUT "${METAL_SHADER_AIR}"
-        COMMAND xcrun -sdk macosx metal -c "${METAL_SHADER_SOURCE}" -o "${METAL_SHADER_AIR}" -std=macos-metal2.4
+        COMMAND xcrun -sdk macosx metal -c "${METAL_SHADER_SOURCE}" -o "${METAL_SHADER_AIR}" -std=macos-metal2.4 -fno-fast-math
         DEPENDS "${METAL_SHADER_SOURCE}"
         COMMENT "Compiling Metal shaders to AIR"
     )

@@ -9,6 +9,7 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
+#include <atomic>
 #include <chrono>
 #include <iostream>
 #include <typeindex>
@@ -139,9 +140,24 @@ struct MetalOps : Ops {
   }
 };
 
-// Helper to dispatch a Metal compute kernel
+// Throw if a command buffer failed (eg. page fault or timeout in a kernel)
+static void checkCommandBuffer(id<MTLCommandBuffer> cmdBuf, const char* what) {
+  if (cmdBuf.status == MTLCommandBufferStatusError) {
+    NSString* desc = cmdBuf.error ? cmdBuf.error.localizedDescription : @"unknown error";
+    throw std::runtime_error(std::string("Metal command buffer failed (") + what +
+                             "): " + desc.UTF8String);
+  }
+}
+
+static std::atomic<int64_t> mpsGemmCount{0};
+int64_t metalMpsGemmCount() { return mpsGemmCount.load(); }
+
+// Helper to dispatch a Metal compute kernel (synchronous)
 static void dispatchKernel(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pipeline,
                            void (^encodeBlock)(id<MTLComputeCommandEncoder>), NSUInteger numThreads) {
+  if (numThreads == 0) {
+    return;  // empty grid: nothing to do (and a 0-sized threadgroup is invalid)
+  }
   @autoreleasepool {
     id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
@@ -160,6 +176,7 @@ static void dispatchKernel(id<MTLCommandQueue> queue, id<MTLComputePipelineState
     [encoder endEncoding];
     [cmdBuf commit];
     [cmdBuf waitUntilCompleted];
+    checkCommandBuffer(cmdBuf, pipeline.label ? pipeline.label.UTF8String : "kernel");
   }
 }
 
@@ -359,8 +376,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
       // Use MPS for larger matrices (threshold based on empirical testing)
       // MPS dispatch overhead makes it slower for small matrices
-      static constexpr int64_t kMpsThreshold = 64 * 64 * 64;  // ~262k ops
-      bool useMps = (m * n * k >= kMpsThreshold);
+      bool useMps = (m * n * k >= kMetalMpsGemmMinOps);
 
       if (useMps) {
         // Use MPS matrix multiplication: C = B * A^T
@@ -426,6 +442,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         [gemm encodeToCommandBuffer:cmdBuf leftMatrix:mpsB rightMatrix:mpsA resultMatrix:mpsC];
         [cmdBuf commit];
         [cmdBuf waitUntilCompleted];
+        checkCommandBuffer(cmdBuf, "MPSMatrixMultiplication");
+        mpsGemmCount++;
       } else {
         // Use Eigen for small matrices (lower overhead)
         using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
@@ -565,6 +583,39 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
             [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
           },
           (NSUInteger)numLumps);
+
+      // Sub-diagonal update: v[below] -= L[below, lump] * v[lump]
+      {
+        id<MTLComputePipelineState> subPipeline =
+            (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+                "sparseElim_subDiagMult_float");
+        dispatchKernel(
+            sym.commandQueue, subPipeline,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+                          offset:0
+                         atIndex:0];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
+                          offset:0
+                         atIndex:1];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                          offset:0
+                         atIndex:2];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
+                          offset:0
+                         atIndex:3];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                          offset:0
+                         atIndex:4];
+              [encoder setBuffer:dataBuffer offset:dataOffset atIndex:5];
+              [encoder setBuffer:cBuffer offset:cOffset atIndex:6];
+              [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:7];
+              [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:8];
+              [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:9];
+              [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:10];
+            },
+            (NSUInteger)numLumps);
+      }
     }
   }
 
@@ -588,12 +639,46 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       int64_t numLumps = lumpsEnd - lumpsBegin;
       if (numLumps <= 0) return;
 
+      int64_t nRHS64 = nRHS;
+
+      // Sub-diagonal update: v[lump] -= L[below, lump]^T * v[below]
+      {
+        id<MTLComputePipelineState> subPipeline =
+            (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+                "sparseElim_subDiagMultT_float");
+        dispatchKernel(
+            sym.commandQueue, subPipeline,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+                          offset:0
+                         atIndex:0];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
+                          offset:0
+                         atIndex:1];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                          offset:0
+                         atIndex:2];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
+                          offset:0
+                         atIndex:3];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                          offset:0
+                         atIndex:4];
+              [encoder setBuffer:dataBuffer offset:dataOffset atIndex:5];
+              [encoder setBuffer:cBuffer offset:cOffset atIndex:6];
+              [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:7];
+              [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:8];
+              [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:9];
+              [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:10];
+            },
+            (NSUInteger)numLumps);
+      }
+
       // Dispatch diagonal solve kernel
       id<MTLComputePipelineState> pipeline =
           (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
               "sparseElim_diagSolveLt_float");
 
-      int64_t nRHS64 = nRHS;
       dispatchKernel(
           sym.commandQueue, pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {

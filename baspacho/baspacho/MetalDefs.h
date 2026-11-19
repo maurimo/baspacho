@@ -32,11 +32,11 @@
  * // Create solver with Metal backend (float only)
  * Settings settings;
  * settings.backend = BackendMetal;
- * auto solver = createSolver<float>(paramSize, structure, settings);
+ * auto solver = createSolver(settings, paramSize, structure);
  *
  * // Use MetalMirror for GPU memory
  * MetalMirror<float> dataGpu(hostData);
- * solver.factor(dataGpu.ptr());
+ * solver->factor(dataGpu.ptr());
  * dataGpu.get(hostData);  // Copy back to CPU
  * ```
  */
@@ -52,6 +52,13 @@
 #include <vector>
 
 namespace BaSpaCho {
+
+// Dense products (syrk/gemm) with m*n*k at least this are run with MetalPerformanceShaders,
+// smaller ones with Eigen on the CPU (over the shared memory)
+constexpr int64_t kMetalMpsGemmMinOps = 64 * 64 * 64;
+
+// Number of dense products run with MetalPerformanceShaders so far (diagnostics, tests)
+int64_t metalMpsGemmCount();
 
 // Error checking macro for Metal operations
 #define mtlCHECK(condition, msg)                                               \
