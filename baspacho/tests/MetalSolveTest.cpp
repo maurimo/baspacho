@@ -76,6 +76,8 @@ void testSolveL(OpsPtr&& ops, int nRHS = 1) {
 
 TEST(MetalSolve, SolveL_float) { testSolveL<float>(metalOps(), 5); }
 
+TEST(MetalSolve, SolveL_1RHS_float) { testSolveL<float>(metalOps(), 1); }
+
 template <typename T>
 void testSolveLt(OpsPtr&& ops, int nRHS = 1) {
   vector<set<int64_t>> colBlocks{{0, 3, 5}, {1}, {2, 4}, {3}, {4}, {5}};
@@ -113,6 +115,8 @@ void testSolveLt(OpsPtr&& ops, int nRHS = 1) {
 }
 
 TEST(MetalSolve, SolveLt_float) { testSolveLt<float>(metalOps(), 5); }
+
+TEST(MetalSolve, SolveLt_1RHS_float) { testSolveLt<float>(metalOps(), 1); }
 
 template <typename T>
 void testSolveLt_SparseElimAndFactor_Many(const std::function<OpsPtr()>& genOps, int nRHS) {
@@ -167,6 +171,10 @@ TEST(MetalSolve, SolveLt_SparseElimAndFactor_Many_float) {
   testSolveLt_SparseElimAndFactor_Many<float>([] { return metalOps(); }, 5);
 }
 
+TEST(MetalSolve, SolveLt_SparseElimAndFactor_Many_1RHS_float) {
+  testSolveLt_SparseElimAndFactor_Many<float>([] { return metalOps(); }, 1);
+}
+
 template <typename T>
 void testSolveL_SparseElimAndFactor_Many(const std::function<OpsPtr()>& genOps, int nRHS) {
   for (int i = 0; i < 20; i++) {
@@ -218,4 +226,8 @@ void testSolveL_SparseElimAndFactor_Many(const std::function<OpsPtr()>& genOps, 
 
 TEST(MetalSolve, SolveL_SparseElimAndFactor_Many_float) {
   testSolveL_SparseElimAndFactor_Many<float>([] { return metalOps(); }, 5);
+}
+
+TEST(MetalSolve, SolveL_SparseElimAndFactor_Many_1RHS_float) {
+  testSolveL_SparseElimAndFactor_Many<float>([] { return metalOps(); }, 1);
 }
