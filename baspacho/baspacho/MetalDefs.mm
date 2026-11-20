@@ -25,6 +25,8 @@ class MetalContextImpl {
   id<MTLLibrary> library;
   std::unordered_map<std::string, id<MTLComputePipelineState>> pipelineCache;
   std::mutex pipelineMutex;
+  std::vector<std::pair<void*, std::function<void()>>> flushers;
+  std::mutex flushersMutex;
 
   MetalContextImpl() {
     @autoreleasepool {
@@ -108,11 +110,31 @@ void* MetalContext::commandQueue() { return (__bridge void*)impl->commandQueue; 
 void* MetalContext::library() { return (__bridge void*)impl->library; }
 
 void MetalContext::synchronize() {
+  std::vector<std::pair<void*, std::function<void()>>> toFlush;
+  {
+    std::lock_guard<std::mutex> lock(impl->flushersMutex);
+    toFlush = impl->flushers;
+  }
+  for (auto& f : toFlush) {
+    f.second();
+  }
   @autoreleasepool {
     id<MTLCommandBuffer> cmdBuf = [impl->commandQueue commandBuffer];
     [cmdBuf commit];
     [cmdBuf waitUntilCompleted];
   }
+}
+
+void MetalContext::addPendingWorkFlusher(void* key, std::function<void()> flusher) {
+  std::lock_guard<std::mutex> lock(impl->flushersMutex);
+  impl->flushers.emplace_back(key, std::move(flusher));
+}
+
+void MetalContext::removePendingWorkFlusher(void* key) {
+  std::lock_guard<std::mutex> lock(impl->flushersMutex);
+  auto& fl = impl->flushers;
+  fl.erase(std::remove_if(fl.begin(), fl.end(), [key](const auto& f) { return f.first == key; }),
+           fl.end());
 }
 
 void* MetalContext::getPipelineState(const char* functionName) {
@@ -163,6 +185,8 @@ void MetalMirror<T>::load(const std::vector<T>& vec) {
     return;
   }
   resizeToAtLeast(vec.size());
+  // GPU work issued so far may still be using the buffer
+  MetalContext::instance().synchronize();
   // Copy data to shared buffer (directly accessible from CPU)
   memcpy(ptr_, vec.data(), vec.size() * sizeof(T));
 }
@@ -172,6 +196,8 @@ void MetalMirror<T>::get(std::vector<T>& vec) const {
   if (!ptr_ || vec.empty()) {
     return;
   }
+  // Wait for the GPU work issued so far (which may be writing the buffer)
+  MetalContext::instance().synchronize();
   // Copy data from shared buffer (directly accessible from CPU)
   memcpy(vec.data(), ptr_, vec.size() * sizeof(T));
 }

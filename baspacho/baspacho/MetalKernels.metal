@@ -643,3 +643,236 @@ kernel void sparseElim_subDiagMultT_float(
         }
     }
 }
+
+// ============================================================================
+// Dense kernels: potrf / trsm / gemm on the blocks of the factor, and the triangular solves,
+// gemv and symm of the solve. Blocks of the factor are row-major, vectors are column-major
+// (leading dimension ldc, nRHS columns). Larger blocks are processed by the host in tiles of
+// kDenseTile, combining the *_tile kernels with dense_gemm_float.
+// Matrix offsets are passed in elements (not as buffer offsets) to avoid alignment constraints.
+// ============================================================================
+
+#define kDenseTile 64  // must match MatOpsMetal.mm
+#define kGemmTile 16   // dense_gemm_float uses kGemmTile x kGemmTile threads (and MatOpsMetal.mm)
+
+// Must match DenseGemmParams in MatOpsMetal.mm
+struct DenseGemmParams {
+    int64_t M, N, K;
+    int64_t aOff, aRowStride, aColStride;  // A(i,p) = A[aOff + i * aRowStride + p * aColStride]
+    int64_t bOff, bRowStride, bColStride;  // B(j,p) = B[bOff + j * bRowStride + p * bColStride]
+    int64_t cOff, cRowStride, cColStride;  // C(i,j) = C[cOff + i * cRowStride + j * cColStride]
+    int64_t lowerOnly;  // only compute C(i,j) with j <= i
+    int64_t aSymLower;  // A is symmetric (M == K), only its lower half is read
+    float alpha, beta;  // C = beta * C + alpha * A * B^T  (if beta == 0, C is not read)
+};
+
+// C = beta * C + alpha * A * B^T, each threadgroup of kGemmTile x kGemmTile threads computes a
+// tile of C, staging tiles of A and B in threadgroup memory
+kernel void dense_gemm_float(device const float* A [[buffer(0)]],
+                             device const float* B [[buffer(1)]],
+                             device float* C [[buffer(2)]],
+                             constant DenseGemmParams& p [[buffer(3)]],
+                             uint2 tg [[threadgroup_position_in_grid]],
+                             uint2 lid [[thread_position_in_threadgroup]]) {
+    threadgroup float tileA[kGemmTile][kGemmTile + 1];
+    threadgroup float tileB[kGemmTile][kGemmTile + 1];
+
+    const int64_t i0 = int64_t(tg.y) * kGemmTile;  // first row of the C tile
+    const int64_t j0 = int64_t(tg.x) * kGemmTile;  // first column of the C tile
+    if (p.lowerOnly && j0 > i0 + kGemmTile - 1) {
+        return;  // tile entirely above the diagonal (uniform in the threadgroup)
+    }
+
+    const int64_t ty = lid.y, tx = lid.x;
+    float acc = 0.0f;
+    for (int64_t k0 = 0; k0 < p.K; k0 += kGemmTile) {
+        int64_t kk = k0 + tx;
+        int64_t ai = i0 + ty;
+        float a = 0.0f;
+        if (ai < p.M && kk < p.K) {
+            bool upper = p.aSymLower && kk > ai;
+            int64_t r = upper ? kk : ai, c = upper ? ai : kk;
+            a = A[p.aOff + r * p.aRowStride + c * p.aColStride];
+        }
+        tileA[ty][tx] = a;
+        int64_t bj = j0 + ty;
+        tileB[ty][tx] = (bj < p.N && kk < p.K) ? B[p.bOff + bj * p.bRowStride + kk * p.bColStride]
+                                               : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int q = 0; q < kGemmTile; q++) {
+            acc += tileA[ty][q] * tileB[tx][q];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const int64_t i = i0 + ty, j = j0 + tx;
+    if (i < p.M && j < p.N && (!p.lowerOnly || j <= i)) {
+        device float* c = C + p.cOff + i * p.cRowStride + j * p.cColStride;
+        *c = (p.beta == 0.0f ? 0.0f : p.beta * *c) + p.alpha * acc;
+    }
+}
+
+// In-place lower Cholesky of the n x n (n <= kDenseTile) row-major block A[aOff], stride lda,
+// in a single threadgroup. Only the lower triangle is read and written. Sets *status to 1 if
+// the block is not positive definite.
+kernel void dense_potrf_tile_float(device float* A [[buffer(0)]],
+                                   constant int64_t& aOff [[buffer(1)]],
+                                   constant int64_t& lda [[buffer(2)]],
+                                   constant int64_t& n64 [[buffer(3)]],
+                                   device atomic_int* status [[buffer(4)]],
+                                   uint lid [[thread_position_in_threadgroup]],
+                                   uint nth [[threads_per_threadgroup]]) {
+    threadgroup float a[kDenseTile][kDenseTile + 1];
+    const int n = int(n64);
+    device float* M = A + aOff;
+
+    for (int e = int(lid); e < n * n; e += int(nth)) {
+        int r = e / n, c = e % n;
+        if (c <= r) {
+            a[r][c] = M[r * lda + c];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int j = 0; j < n; j++) {
+        float d = a[j][j];
+        if (lid == 0 && !(d > 0.0f)) {
+            atomic_store_explicit(status, 1, memory_order_relaxed);
+        }
+        d = sqrt(d);
+        for (int i = j + 1 + int(lid); i < n; i += int(nth)) {
+            a[i][j] /= d;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid == 0) {
+            a[j][j] = d;
+        }
+        // trailing update of the lower triangle: a[r][c] -= a[r][j] * a[c][j], j < c <= r
+        const int m = n - j - 1;
+        for (int e = int(lid); e < m * m; e += int(nth)) {
+            int r = j + 1 + e / m, c = j + 1 + e % m;
+            if (c <= r) {
+                a[r][c] -= a[r][j] * a[c][j];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (int e = int(lid); e < n * n; e += int(nth)) {
+        int r = e / n, c = e % n;
+        if (c <= r) {
+            M[r * lda + c] = a[r][c];
+        }
+    }
+}
+
+// B := B * L^-T, for L the n x n (n <= kDenseTile) lower triangular row-major block L[lOff]
+// (stride ldl) and B the numRows x n row-major block B[bOff] (stride ldb). One thread per
+// row of B, L is staged in threadgroup memory.
+kernel void dense_trsm_tile_float(device const float* L [[buffer(0)]],
+                                  constant int64_t& lOff [[buffer(1)]],
+                                  constant int64_t& ldl [[buffer(2)]],
+                                  device float* B [[buffer(3)]],
+                                  constant int64_t& bOff [[buffer(4)]],
+                                  constant int64_t& ldb [[buffer(5)]],
+                                  constant int64_t& n64 [[buffer(6)]],
+                                  constant int64_t& numRows [[buffer(7)]],
+                                  uint lid [[thread_position_in_threadgroup]],
+                                  uint nth [[threads_per_threadgroup]],
+                                  uint tgid [[threadgroup_position_in_grid]]) {
+    threadgroup float l[kDenseTile][kDenseTile + 1];
+    const int n = int(n64);
+
+    for (int e = int(lid); e < n * n; e += int(nth)) {
+        int r = e / n, c = e % n;
+        if (c <= r) {
+            l[r][c] = L[lOff + r * ldl + c];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int64_t row = int64_t(tgid) * nth + lid;
+    if (row < numRows) {
+        device float* b = B + bOff + row * ldb;
+        for (int j = 0; j < n; j++) {
+            float s = b[j];
+            for (int q = 0; q < j; q++) {
+                s -= l[j][q] * b[q];
+            }
+            b[j] = s / l[j][j];
+        }
+    }
+}
+
+// Solves L * x = c (transpose == 0) or L^T * x = c (transpose != 0) in place, for L the
+// n x n (n <= kDenseTile) lower triangular row-major block L[lOff] (stride ldl), and c the
+// n x nRHS column-major block C[cOff] (stride ldc). One threadgroup per right hand side.
+kernel void dense_trsv_tile_float(device const float* L [[buffer(0)]],
+                                  constant int64_t& lOff [[buffer(1)]],
+                                  constant int64_t& ldl [[buffer(2)]],
+                                  device float* C [[buffer(3)]],
+                                  constant int64_t& cOff [[buffer(4)]],
+                                  constant int64_t& ldc [[buffer(5)]],
+                                  constant int64_t& n64 [[buffer(6)]],
+                                  constant int64_t& transpose [[buffer(7)]],
+                                  uint lid [[thread_position_in_threadgroup]],
+                                  uint nth [[threads_per_threadgroup]],
+                                  uint tgid [[threadgroup_position_in_grid]]) {
+    threadgroup float l[kDenseTile][kDenseTile + 1];
+    threadgroup float x[kDenseTile];
+    const int n = int(n64);
+    device float* c = C + cOff + int64_t(tgid) * ldc;
+
+    for (int e = int(lid); e < n * n; e += int(nth)) {
+        int r = e / n, q = e % n;
+        if (q <= r) {
+            l[r][q] = L[lOff + r * ldl + q];
+        }
+    }
+    for (int i = int(lid); i < n; i += int(nth)) {
+        x[i] = c[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (transpose == 0) {
+        for (int j = 0; j < n; j++) {
+            if (lid == 0) {
+                x[j] /= l[j][j];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = j + 1 + int(lid); i < n; i += int(nth)) {
+                x[i] -= l[i][j] * x[j];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    } else {
+        for (int j = n - 1; j >= 0; j--) {
+            if (lid == 0) {
+                x[j] /= l[j][j];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = int(lid); i < j; i += int(nth)) {
+                x[i] -= l[j][i] * x[j];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    for (int i = int(lid); i < n; i += int(nth)) {
+        c[i] = x[i];
+    }
+}
+
+// spanToChainOffset[chainRowSpan[i]] = chainData[i] for i in [begin, end), ie the map used by
+// assemble_kernel_float for the target lump (written on the GPU, in order with the other work)
+kernel void set_span_to_chain_offset_float(device const int64_t* chainRowSpan [[buffer(0)]],
+                                           device const int64_t* chainData [[buffer(1)]],
+                                           device int64_t* spanToChainOffset [[buffer(2)]],
+                                           constant int64_t& begin [[buffer(3)]],
+                                           constant int64_t& end [[buffer(4)]],
+                                           uint tid [[thread_position_in_grid]]) {
+    int64_t i = begin + int64_t(tid);
+    if (i < end) {
+        spanToChainOffset[chainRowSpan[i]] = chainData[i];
+    }
+}

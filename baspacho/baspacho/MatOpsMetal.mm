@@ -14,7 +14,6 @@
 #include <iostream>
 #include <typeindex>
 
-#include <Eigen/Dense>
 #include "baspacho/baspacho/CoalescedBlockMatrix.h"
 #include "baspacho/baspacho/DebugMacros.h"
 #include "baspacho/baspacho/MatOps.h"
@@ -152,44 +151,460 @@ static void checkCommandBuffer(id<MTLCommandBuffer> cmdBuf, const char* what) {
 static std::atomic<int64_t> mpsGemmCount{0};
 int64_t metalMpsGemmCount() { return mpsGemmCount.load(); }
 
-// Helper to dispatch a Metal compute kernel (synchronous)
-static void dispatchKernel(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pipeline,
-                           void (^encodeBlock)(id<MTLComputeCommandEncoder>), NSUInteger numThreads) {
-  if (numThreads == 0) {
-    return;  // empty grid: nothing to do (and a 0-sized threadgroup is invalid)
+// Records the GPU work of a numeric/solve context: dispatches are encoded in order in a serial
+// compute encoder (so each one sees the results of the previous ones), and command buffers are
+// committed in batches without waiting. The CPU waits only in flush(), called when the results
+// are needed on the host: by MetalMirror::get/load (via MetalContext::synchronize), and when
+// the context is destroyed (ie at the end of Solver::factor, solve, etc).
+class MetalStream {
+ public:
+  static constexpr int kMaxDispatchesPerCommandBuffer = 256;
+
+  explicit MetalStream(id<MTLCommandQueue> queue_) : queue(queue_) {
+    MetalContext::instance().addPendingWorkFlusher(this, [this] { flush(); });
   }
-  @autoreleasepool {
-    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
-    id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
 
-    [encoder setComputePipelineState:pipeline];
-    encodeBlock(encoder);
-
-    // Calculate thread group size
-    NSUInteger threadGroupSize = MIN(pipeline.maxTotalThreadsPerThreadgroup, 256);
-    threadGroupSize = MIN(threadGroupSize, numThreads);
-
-    MTLSize threadsPerGroup = MTLSizeMake(threadGroupSize, 1, 1);
-    MTLSize numGroups = MTLSizeMake((numThreads + threadGroupSize - 1) / threadGroupSize, 1, 1);
-
-    [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
-    [encoder endEncoding];
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
-    checkCommandBuffer(cmdBuf, pipeline.label ? pipeline.label.UTF8String : "kernel");
+  ~MetalStream() {
+    MetalContext::instance().removePendingWorkFlusher(this);
+    try {
+      flush();
+    } catch (const std::exception& e) {
+      fprintf(stderr, "Metal: %s\n", e.what());
+    }
   }
+
+  MetalStream(const MetalStream&) = delete;
+  MetalStream& operator=(const MetalStream&) = delete;
+
+  // 1D grid of numThreads threads (in threadgroups of up to 256)
+  void dispatch(id<MTLComputePipelineState> pipeline,
+                void (^encodeBlock)(id<MTLComputeCommandEncoder>), NSUInteger numThreads) {
+    if (numThreads == 0) {
+      return;  // empty grid: nothing to do (and a 0-sized threadgroup is invalid)
+    }
+    NSUInteger groupSize = MIN(MIN(pipeline.maxTotalThreadsPerThreadgroup, 256), numThreads);
+    dispatchGroups(pipeline, encodeBlock,
+                   MTLSizeMake((numThreads + groupSize - 1) / groupSize, 1, 1),
+                   MTLSizeMake(groupSize, 1, 1));
+  }
+
+  void dispatchGroups(id<MTLComputePipelineState> pipeline,
+                      void (^encodeBlock)(id<MTLComputeCommandEncoder>), MTLSize numGroups,
+                      MTLSize groupSize) {
+    if (numGroups.width * numGroups.height * numGroups.depth == 0) {
+      return;
+    }
+    NSUInteger groupThreads = groupSize.width * groupSize.height * groupSize.depth;
+    if (groupThreads > pipeline.maxTotalThreadsPerThreadgroup) {
+      throw std::runtime_error("Metal: threadgroup of " + std::to_string(groupThreads) +
+                               " threads exceeds the pipeline limit of " +
+                               std::to_string(pipeline.maxTotalThreadsPerThreadgroup));
+    }
+    @autoreleasepool {
+      if (!encoder) {
+        encoder = [commandBuffer() computeCommandEncoder];
+      }
+      [encoder setComputePipelineState:pipeline];
+      encodeBlock(encoder);
+      [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:groupSize];
+    }
+    countDispatch();
+  }
+
+  // Command buffer to encode MetalPerformanceShaders kernels into, after the work recorded so
+  // far. Call countDispatch() after encoding
+  id<MTLCommandBuffer> commandBufferForMps() {
+    endEncoding();
+    return commandBuffer();
+  }
+
+  void countDispatch() {
+    if (++numDispatches >= kMaxDispatchesPerCommandBuffer) {
+      commit();
+    }
+  }
+
+  // Commits the recorded work (without waiting)
+  void commit() {
+    endEncoding();
+    if (cmdBuf) {
+      [cmdBuf commit];
+      committed.push_back(cmdBuf);
+      cmdBuf = nil;
+      numDispatches = 0;
+    }
+  }
+
+  // Commits the recorded work and waits for its completion, throws on errors
+  void flush() {
+    @autoreleasepool {
+      commit();
+      std::vector<id<MTLCommandBuffer>> toWait;
+      toWait.swap(committed);
+      for (id<MTLCommandBuffer> buf : toWait) {
+        [buf waitUntilCompleted];
+      }
+      for (id<MTLCommandBuffer> buf : toWait) {
+        checkCommandBuffer(buf, "MetalStream");
+      }
+    }
+  }
+
+ private:
+  id<MTLCommandBuffer> commandBuffer() {
+    if (!cmdBuf) {
+      cmdBuf = [queue commandBuffer];
+    }
+    return cmdBuf;
+  }
+
+  void endEncoding() {
+    if (encoder) {
+      [encoder endEncoding];
+      encoder = nil;
+    }
+  }
+
+  id<MTLCommandQueue> queue;
+  id<MTLCommandBuffer> cmdBuf = nil;
+  id<MTLComputeCommandEncoder> encoder = nil;
+  std::vector<id<MTLCommandBuffer>> committed;
+  int numDispatches = 0;
+};
+
+static id<MTLComputePipelineState> metalPipeline(const char* name) {
+  return (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(name);
 }
+
+// A pointer registered with MetalBufferRegistry, as (buffer, byte offset)
+struct MetalBufRef {
+  id<MTLBuffer> buf;
+  size_t off;
+};
+
+static MetalBufRef findMetalBuf(const void* ptr, const char* what) {
+  auto info = MetalBufferRegistry::instance().findBuffer(ptr);
+  if (!info.first) {
+    throw std::runtime_error(std::string(what) + ": buffer not found (data must be allocated " +
+                             "with MetalMirror)");
+  }
+  return MetalBufRef{(__bridge id<MTLBuffer>)info.first, info.second};
+}
+
+// Dense kernels (see MetalKernels.metal). Blocks of the factor are row-major, vectors are
+// column-major. Blocks larger than kMetalDenseTile are processed in tiles.
+static constexpr int64_t kMetalDenseTile = 64;  // kDenseTile in MetalKernels.metal
+static constexpr int64_t kMetalGemmTile = 16;   // kGemmTile in MetalKernels.metal
+
+// Must match DenseGemmParams in MetalKernels.metal
+struct DenseGemmParams {
+  int64_t M, N, K;
+  int64_t aOff, aRowStride, aColStride;  // A(i,p) = A[aOff + i * aRowStride + p * aColStride]
+  int64_t bOff, bRowStride, bColStride;  // B(j,p) = B[bOff + j * bRowStride + p * bColStride]
+  int64_t cOff, cRowStride, cColStride;  // C(i,j) = C[cOff + i * cRowStride + j * cColStride]
+  int64_t lowerOnly;  // only compute C(i,j) with j <= i
+  int64_t aSymLower;  // A is symmetric (M == K), only its lower half is read
+  float alpha, beta;  // C = beta * C + alpha * A * B^T  (if beta == 0, C is not read)
+};
+static_assert(sizeof(DenseGemmParams) == 15 * 8, "DenseGemmParams layout");
+
+struct MetalDense {
+  // C = beta * C + alpha * A * B^T (see DenseGemmParams)
+  static void gemm(MetalStream& stream, const MetalBufRef& a, const MetalBufRef& b,
+                   const MetalBufRef& c, const DenseGemmParams& prm) {
+    if (prm.M <= 0 || prm.N <= 0) {
+      return;
+    }
+    BASPACHO_CHECK_GT(prm.K, 0);
+    const DenseGemmParams p = prm;
+    stream.dispatchGroups(
+        metalPipeline("dense_gemm_float"),
+        ^(id<MTLComputeCommandEncoder> encoder) {
+          [encoder setBuffer:a.buf offset:a.off atIndex:0];
+          [encoder setBuffer:b.buf offset:b.off atIndex:1];
+          [encoder setBuffer:c.buf offset:c.off atIndex:2];
+          [encoder setBytes:&p length:sizeof(p) atIndex:3];
+        },
+        MTLSizeMake((p.N + kMetalGemmTile - 1) / kMetalGemmTile,
+                    (p.M + kMetalGemmTile - 1) / kMetalGemmTile, 1),
+        MTLSizeMake(kMetalGemmTile, kMetalGemmTile, 1));
+  }
+
+  static void potrfTile(MetalStream& stream, const MetalBufRef& a, int64_t aOff, int64_t lda,
+                        int64_t n, const MetalBufRef& status) {
+    id<MTLComputePipelineState> pipeline = metalPipeline("dense_potrf_tile_float");
+    NSUInteger threads = MIN(256, MAX(32, ((n * n + 31) / 32) * 32));
+    stream.dispatchGroups(
+        pipeline,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+          [encoder setBuffer:a.buf offset:a.off atIndex:0];
+          [encoder setBytes:&aOff length:sizeof(int64_t) atIndex:1];
+          [encoder setBytes:&lda length:sizeof(int64_t) atIndex:2];
+          [encoder setBytes:&n length:sizeof(int64_t) atIndex:3];
+          [encoder setBuffer:status.buf offset:status.off atIndex:4];
+        },
+        MTLSizeMake(1, 1, 1), MTLSizeMake(threads, 1, 1));
+  }
+
+  // B := B * L^-T, L (n x n, n <= tile) lower at lOff, B (numRows x n) at bOff
+  static void trsmTile(MetalStream& stream, const MetalBufRef& l, int64_t lOff, int64_t ldl,
+                       const MetalBufRef& b, int64_t bOff, int64_t ldb, int64_t n,
+                       int64_t numRows) {
+    if (numRows <= 0) {
+      return;
+    }
+    const NSUInteger threads = 256;
+    stream.dispatchGroups(
+        metalPipeline("dense_trsm_tile_float"),
+        ^(id<MTLComputeCommandEncoder> encoder) {
+          [encoder setBuffer:l.buf offset:l.off atIndex:0];
+          [encoder setBytes:&lOff length:sizeof(int64_t) atIndex:1];
+          [encoder setBytes:&ldl length:sizeof(int64_t) atIndex:2];
+          [encoder setBuffer:b.buf offset:b.off atIndex:3];
+          [encoder setBytes:&bOff length:sizeof(int64_t) atIndex:4];
+          [encoder setBytes:&ldb length:sizeof(int64_t) atIndex:5];
+          [encoder setBytes:&n length:sizeof(int64_t) atIndex:6];
+          [encoder setBytes:&numRows length:sizeof(int64_t) atIndex:7];
+        },
+        MTLSizeMake((numRows + threads - 1) / threads, 1, 1), MTLSizeMake(threads, 1, 1));
+  }
+
+  // solves L * x = c (or L^T * x = c), L (n x n, n <= tile) lower at lOff, c at cOff (n x nRHS)
+  static void trsvTile(MetalStream& stream, const MetalBufRef& l, int64_t lOff, int64_t ldl,
+                       const MetalBufRef& c, int64_t cOff, int64_t ldc, int64_t n, int nRHS,
+                       bool transpose) {
+    const int64_t transp = transpose ? 1 : 0;
+    stream.dispatchGroups(
+        metalPipeline("dense_trsv_tile_float"),
+        ^(id<MTLComputeCommandEncoder> encoder) {
+          [encoder setBuffer:l.buf offset:l.off atIndex:0];
+          [encoder setBytes:&lOff length:sizeof(int64_t) atIndex:1];
+          [encoder setBytes:&ldl length:sizeof(int64_t) atIndex:2];
+          [encoder setBuffer:c.buf offset:c.off atIndex:3];
+          [encoder setBytes:&cOff length:sizeof(int64_t) atIndex:4];
+          [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
+          [encoder setBytes:&n length:sizeof(int64_t) atIndex:6];
+          [encoder setBytes:&transp length:sizeof(int64_t) atIndex:7];
+        },
+        MTLSizeMake(nRHS, 1, 1), MTLSizeMake(kMetalDenseTile, 1, 1));
+  }
+
+  // ---- Algorithms on top of the kernels above (plain C++, until the end of MetalDense) ----
+
+  // params for C = A * B^T, to be completed with offsets and strides
+  static DenseGemmParams params(int64_t M, int64_t N, int64_t K) {
+    DenseGemmParams p = {};
+    p.M = M;
+    p.N = N;
+    p.K = K;
+    p.alpha = 1.0f;
+    p.beta = 0.0f;
+    return p;
+  }
+
+  // temp (n x m, row-major) = B * A^T, A (m x k) and B (n x k) both row-major at offset
+  static void syrkGemm(MetalStream& stream, const MetalBufRef& d, int64_t m, int64_t n, int64_t k,
+                       int64_t offset, const MetalBufRef& temp) {
+    DenseGemmParams p = params(n, m, k);
+    p.aOff = p.bOff = offset;
+    p.aRowStride = p.bRowStride = k;
+    p.aColStride = p.bColStride = 1;
+    p.cOff = 0;
+    p.cRowStride = m;
+    p.cColStride = 1;
+    gemm(stream, d, d, temp, p);
+  }
+
+  // D += alpha * A * C, A the symmetric n x n block at offM (lower half stored), C and D
+  // column-major n x nRHS at offC (strides ldc and ldd)
+  static void symm(MetalStream& stream, const MetalBufRef& d, int64_t offM, int64_t n,
+                   const MetalBufRef& c, int64_t offC, int64_t ldc, const MetalBufRef& dst,
+                   int64_t ldd, int nRHS, float alpha) {
+    DenseGemmParams p = params(n, nRHS, n);
+    p.aOff = offM;
+    p.aRowStride = n;
+    p.aColStride = 1;
+    p.aSymLower = 1;
+    p.bOff = offC;
+    p.bRowStride = ldc;
+    p.bColStride = 1;
+    p.cOff = offC;
+    p.cRowStride = 1;
+    p.cColStride = ldd;
+    p.alpha = alpha;
+    p.beta = 1.0f;
+    gemm(stream, d, c, dst, p);
+  }
+
+  // temp (nRows x nRHS, row-major) = alpha * M * A, M the nRows x nCols block at offM, A
+  // column-major nCols x nRHS at offA (stride lda)
+  static void gemv(MetalStream& stream, const MetalBufRef& d, int64_t offM, int64_t nRows,
+                   int64_t nCols, const MetalBufRef& a, int64_t offA, int64_t lda, int nRHS,
+                   float alpha, const MetalBufRef& temp) {
+    DenseGemmParams p = params(nRows, nRHS, nCols);
+    p.aOff = offM;
+    p.aRowStride = nCols;
+    p.aColStride = 1;
+    p.bOff = offA;
+    p.bRowStride = lda;
+    p.bColStride = 1;
+    p.cOff = 0;
+    p.cRowStride = nRHS;
+    p.cColStride = 1;
+    p.alpha = alpha;
+    gemm(stream, d, a, temp, p);
+  }
+
+  // A += alpha * M^T * temp (see gemv)
+  static void gemvT(MetalStream& stream, const MetalBufRef& d, int64_t offM, int64_t nRows,
+                    int64_t nCols, const MetalBufRef& a, int64_t offA, int64_t lda, int nRHS,
+                    float alpha, const MetalBufRef& temp) {
+    DenseGemmParams p = params(nCols, nRHS, nRows);
+    p.aOff = offM;
+    p.aRowStride = 1;
+    p.aColStride = nCols;
+    p.bOff = 0;
+    p.bRowStride = 1;
+    p.bColStride = nRHS;
+    p.cOff = offA;
+    p.cRowStride = 1;
+    p.cColStride = lda;
+    p.alpha = alpha;
+    p.beta = 1.0f;
+    gemm(stream, d, temp, a, p);
+  }
+
+  // In-place lower Cholesky of the n x n row-major block at offA (right-looking, by tiles)
+  static void potrf(MetalStream& stream, const MetalBufRef& d, int64_t n, int64_t offA,
+                    const MetalBufRef& status) {
+    for (int64_t jb = 0; jb < n; jb += kMetalDenseTile) {
+      int64_t bs = std::min(kMetalDenseTile, n - jb);
+      int64_t diag = offA + jb * n + jb;
+      potrfTile(stream, d, diag, n, bs, status);
+      int64_t rem = n - jb - bs;
+      if (rem == 0) {
+        break;
+      }
+      int64_t below = diag + bs * n;
+      trsmTile(stream, d, diag, n, d, below, n, bs, rem);
+      // A22 -= L21 * L21^T (lower half)
+      DenseGemmParams p = params(rem, rem, bs);
+      p.aOff = p.bOff = below;
+      p.aRowStride = p.bRowStride = n;
+      p.aColStride = p.bColStride = 1;
+      p.cOff = below + bs;
+      p.cRowStride = n;
+      p.cColStride = 1;
+      p.lowerOnly = 1;
+      p.alpha = -1.0f;
+      p.beta = 1.0f;
+      gemm(stream, d, d, d, p);
+    }
+  }
+
+  // B := B * L^-T, L the n x n diag block at offA, B the k x n block at offB (stride n)
+  static void trsm(MetalStream& stream, const MetalBufRef& d, int64_t n, int64_t k, int64_t offA,
+                   int64_t offB) {
+    for (int64_t jb = 0; jb < n; jb += kMetalDenseTile) {
+      int64_t bs = std::min(kMetalDenseTile, n - jb);
+      trsmTile(stream, d, offA + jb * n + jb, n, d, offB + jb, n, bs, k);
+      int64_t rem = n - jb - bs;
+      if (rem == 0) {
+        break;
+      }
+      // B2 -= X1 * L21^T
+      DenseGemmParams p = params(k, rem, bs);
+      p.aOff = offB + jb;
+      p.aRowStride = n;
+      p.aColStride = 1;
+      p.bOff = offA + (jb + bs) * n + jb;
+      p.bRowStride = n;
+      p.bColStride = 1;
+      p.cOff = offB + jb + bs;
+      p.cRowStride = n;
+      p.cColStride = 1;
+      p.alpha = -1.0f;
+      p.beta = 1.0f;
+      gemm(stream, d, d, d, p);
+    }
+  }
+
+  // solves L * x = c in place, L the n x n diag block at offM, c at offC (n x nRHS, stride ldc)
+  static void solveL(MetalStream& stream, const MetalBufRef& d, int64_t offM, int64_t n,
+                     const MetalBufRef& c, int64_t offC, int64_t ldc, int nRHS) {
+    for (int64_t jb = 0; jb < n; jb += kMetalDenseTile) {
+      int64_t bs = std::min(kMetalDenseTile, n - jb);
+      trsvTile(stream, d, offM + jb * n + jb, n, c, offC + jb, ldc, bs, nRHS, false);
+      int64_t rem = n - jb - bs;
+      if (rem == 0) {
+        break;
+      }
+      // c2 -= L21 * x1
+      DenseGemmParams p = params(rem, nRHS, bs);
+      p.aOff = offM + (jb + bs) * n + jb;
+      p.aRowStride = n;
+      p.aColStride = 1;
+      p.bOff = offC + jb;
+      p.bRowStride = ldc;
+      p.bColStride = 1;
+      p.cOff = offC + jb + bs;
+      p.cRowStride = 1;
+      p.cColStride = ldc;
+      p.alpha = -1.0f;
+      p.beta = 1.0f;
+      gemm(stream, d, c, c, p);
+    }
+  }
+
+  // solves L^T * x = c in place (see solveL)
+  static void solveLt(MetalStream& stream, const MetalBufRef& d, int64_t offM, int64_t n,
+                      const MetalBufRef& c, int64_t offC, int64_t ldc, int nRHS) {
+    int64_t numTiles = (n + kMetalDenseTile - 1) / kMetalDenseTile;
+    for (int64_t t = numTiles - 1; t >= 0; t--) {
+      int64_t jb = t * kMetalDenseTile;
+      int64_t bs = std::min(kMetalDenseTile, n - jb);
+      trsvTile(stream, d, offM + jb * n + jb, n, c, offC + jb, ldc, bs, nRHS, true);
+      if (jb == 0) {
+        break;
+      }
+      // c1 -= L21^T * x2, where L21 = L[jb:jb+bs, 0:jb]
+      DenseGemmParams p = params(jb, nRHS, bs);
+      p.aOff = offM + jb * n;
+      p.aRowStride = 1;
+      p.aColStride = n;
+      p.bOff = offC + jb;
+      p.bRowStride = ldc;
+      p.bColStride = 1;
+      p.cOff = offC;
+      p.cRowStride = 1;
+      p.cColStride = ldc;
+      p.alpha = -1.0f;
+      p.beta = 1.0f;
+      gemm(stream, d, c, c, p);
+    }
+  }
+};
 
 // Numeric context for float - Metal implementation
 template <>
 struct MetalNumericCtx<float> : NumericCtx<float> {
   MetalNumericCtx(MetalSymbolicCtx& sym_, int64_t tempBufSize, int64_t numSpans)
-      : sym(sym_), numSpans_(numSpans), spanToChainOffset(numSpans) {
+      : sym(sym_), numSpans_(numSpans), stream(sym_.commandQueue) {
     tempBuffer.resizeToAtLeast(tempBufSize);
     devSpanToChainOffset.resizeToAtLeast(numSpans);
+    potrfStatus.load(std::vector<int32_t>{0});
   }
 
-  virtual ~MetalNumericCtx() override {}
+  virtual ~MetalNumericCtx() override {
+    try {
+      stream.flush();
+    } catch (const std::exception& e) {
+      fprintf(stderr, "Metal: %s\n", e.what());
+    }
+    if (potrfStatus.ptr()[0] != 0) {
+      fprintf(stderr, "Metal potrf: Cholesky failed (matrix not positive definite)\n");
+    }
+  }
 
   virtual void pseudoFactorSpans(float* data, int64_t spanBegin, int64_t spanEnd) override {
     @autoreleasepool {
@@ -209,8 +624,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       int64_t numSpans = spanEnd - spanBegin;
       if (numSpans <= 0) return;
 
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      stream.dispatch(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanToLump.buffer() offset:0 atIndex:0];
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanOffsetInLump.buffer()
@@ -264,8 +679,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
             (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
                 "factor_lumps_kernel_float");
 
-        dispatchKernel(
-            sym.commandQueue, pipeline,
+        stream.dispatch(
+            pipeline,
             ^(id<MTLComputeCommandEncoder> encoder) {
               [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
                           offset:0
@@ -298,8 +713,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
             (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
                 "sparse_elim_straight_kernel_float");
 
-        dispatchKernel(
-            sym.commandQueue, pipeline,
+        stream.dispatch(
+            pipeline,
             ^(id<MTLComputeCommandEncoder> encoder) {
               [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
                           offset:0
@@ -336,139 +751,105 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   virtual void potrf(int64_t n, float* data, int64_t offA) override {
-    @autoreleasepool {
-      if (n <= 0) return;
-
-      // Use row-major (matches CpuBaseNumericCtx)
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-
-      Eigen::Map<MatRMaj> matA(data + offA, n, n);
-      Eigen::LLT<Eigen::Ref<MatRMaj>> llt(matA);
-
-      if (llt.info() != Eigen::Success) {
-        fprintf(stderr, "Metal potrf: Cholesky failed\n");
-      }
-    }
+    if (n <= 0) return;
+    MetalBufRef d = findMetalBuf(data, "MetalNumericCtx<float>::potrf");
+    MetalBufRef status{(__bridge id<MTLBuffer>)potrfStatus.buffer(), 0};
+    MetalDense::potrf(stream, d, n, offA, status);
   }
 
   virtual void trsm(int64_t n, int64_t k, float* data, int64_t offA, int64_t offB) override {
-    @autoreleasepool {
-      if (n <= 0 || k <= 0) return;
-
-      // Use row-major for B, column-major for A (matches CpuBaseNumericCtx)
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-      using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
-
-      // col-major's upper = (row-major's lower).transpose()
-      Eigen::Map<const MatCMaj> matA(data + offA, n, n);
-      Eigen::Map<MatRMaj> matB(data + offB, k, n);
-      matA.template triangularView<Eigen::Upper>().template solveInPlace<Eigen::OnTheRight>(matB);
-    }
+    if (n <= 0 || k <= 0) return;
+    MetalBufRef d = findMetalBuf(data, "MetalNumericCtx<float>::trsm");
+    MetalDense::trsm(stream, d, n, k, offA, offB);
   }
 
+  // tempBuffer (n x m, row-major) = B * A^T, A (m x k) and B (n x k) both starting at offset
   virtual void saveSyrkGemm(int64_t m, int64_t n, int64_t k, const float* data,
                             int64_t offset) override {
     @autoreleasepool {
       if (m <= 0 || n <= 0 || k <= 0) return;
 
-      // Ensure temp buffer is large enough
+      // (no need to wait: a reallocated buffer is retained by the command buffers using it,
+      // and the contents of tempBuffer are only used by the following assemble)
       tempBuffer.resizeToAtLeast(m * n);
+      MetalBufRef d = findMetalBuf(data, "MetalNumericCtx<float>::saveSyrkGemm");
+      MetalBufRef temp{(__bridge id<MTLBuffer>)tempBuffer.buffer(), 0};
 
-      // Use MPS for larger matrices (threshold based on empirical testing)
-      // MPS dispatch overhead makes it slower for small matrices
-      bool useMps = (m * n * k >= kMetalMpsGemmMinOps);
-
-      if (useMps) {
-        // Use MPS matrix multiplication: C = B * A^T
-        // Input: data[offset] is row-major with dims (m, k) for A and (n, k) for B (same memory)
-        // Output: tempBuffer is row-major with dims (n, m)
-        //
-        // MPS uses row-major storage. MPSMatrixMultiplication computes:
+      // MetalPerformanceShaders for larger matrices, as its dispatch overhead makes it slower
+      // than the simple kernel for small matrices
+      if (m * n * k >= kMetalMpsGemmMinOps) {
+        // MPS uses row-major storage, and computes
         //   result = alpha * op(left) * op(right) + beta * result
-        //
-        // We want: C(n,m) = B(n,k) * A^T(k,m)
-        // So: left=B, right=A with transposeRight=YES
-
-        auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
-        if (!dataBufferInfo.first) {
-          throw std::runtime_error("MetalNumericCtx<float>::saveSyrkGemm: data buffer not found");
-        }
-        id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
-        size_t dataBaseOffset = dataBufferInfo.second;
-        id<MTLBuffer> tempBuf = (__bridge id<MTLBuffer>)tempBuffer.buffer();
-
-        // Matrix A: row-major (m rows, k cols), stride = k
+        // We want C(n,m) = B(n,k) * A^T(k,m), so: left=B, right=A with transposeRight=YES
         MPSMatrixDescriptor* descA =
             [MPSMatrixDescriptor matrixDescriptorWithRows:m
                                                   columns:k
                                                  rowBytes:k * sizeof(float)
                                                  dataType:MPSDataTypeFloat32];
-
-        // Matrix B: row-major (n rows, k cols), stride = k
         MPSMatrixDescriptor* descB =
             [MPSMatrixDescriptor matrixDescriptorWithRows:n
                                                   columns:k
                                                  rowBytes:k * sizeof(float)
                                                  dataType:MPSDataTypeFloat32];
-
-        // Matrix C: row-major (n rows, m cols), stride = m
         MPSMatrixDescriptor* descC =
             [MPSMatrixDescriptor matrixDescriptorWithRows:n
                                                   columns:m
                                                  rowBytes:m * sizeof(float)
                                                  dataType:MPSDataTypeFloat32];
 
-        MPSMatrix* mpsA = [[MPSMatrix alloc] initWithBuffer:dataBuffer
-                                                     offset:dataBaseOffset + offset * sizeof(float)
+        MPSMatrix* mpsA = [[MPSMatrix alloc] initWithBuffer:d.buf
+                                                     offset:d.off + offset * sizeof(float)
                                                  descriptor:descA];
-        MPSMatrix* mpsB = [[MPSMatrix alloc] initWithBuffer:dataBuffer
-                                                     offset:dataBaseOffset + offset * sizeof(float)
+        MPSMatrix* mpsB = [[MPSMatrix alloc] initWithBuffer:d.buf
+                                                     offset:d.off + offset * sizeof(float)
                                                  descriptor:descB];
-        MPSMatrix* mpsC = [[MPSMatrix alloc] initWithBuffer:tempBuf offset:0 descriptor:descC];
+        MPSMatrix* mpsC = [[MPSMatrix alloc] initWithBuffer:temp.buf offset:0 descriptor:descC];
 
-        // Compute: C(n,m) = B(n,k) * A^T(k,m)
-        // left=B, right=A, transposeRight=YES
         MPSMatrixMultiplication* gemm =
             [[MPSMatrixMultiplication alloc] initWithDevice:sym.device
-                                              transposeLeft:NO    // B as-is
-                                             transposeRight:YES   // A^T
+                                              transposeLeft:NO
+                                             transposeRight:YES
                                                  resultRows:n
                                               resultColumns:m
                                             interiorColumns:k
                                                       alpha:1.0
                                                        beta:0.0];
 
-        id<MTLCommandBuffer> cmdBuf = [sym.commandQueue commandBuffer];
-        [gemm encodeToCommandBuffer:cmdBuf leftMatrix:mpsB rightMatrix:mpsA resultMatrix:mpsC];
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
-        checkCommandBuffer(cmdBuf, "MPSMatrixMultiplication");
+        [gemm encodeToCommandBuffer:stream.commandBufferForMps()
+                         leftMatrix:mpsB
+                        rightMatrix:mpsA
+                       resultMatrix:mpsC];
+        stream.countDispatch();
         mpsGemmCount++;
       } else {
-        // Use Eigen for small matrices (lower overhead)
-        using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-
-        const float* AB = data + offset;
-        Eigen::Map<const MatRMaj> matA(AB, m, k);
-        Eigen::Map<const MatRMaj> matB(AB, n, k);
-        Eigen::Map<MatRMaj> matC(tempBuffer.ptr(), n, m);
-        matC.noalias() = matB * matA.transpose();
+        MetalDense::syrkGemm(stream, d, m, n, k, offset, temp);
       }
     }
   }
 
+  // Sets the span -> chain data offset map of the target lump, used by assemble. It is written
+  // by a kernel, so that it is ordered with the assemble calls of the previous target lumps
   virtual void prepareAssemble(int64_t targetLump) override {
-    // Prepare chain offset mapping for assembly (same as CUDA version)
-    const CoalescedBlockMatrixSkel& skel = sym.skel;
-
-    for (int64_t i = skel.chainColPtr[targetLump], iEnd = skel.chainColPtr[targetLump + 1]; i < iEnd;
-         i++) {
-      spanToChainOffset[skel.chainRowSpan[i]] = skel.chainData[i];
+    @autoreleasepool {
+      int64_t begin = sym.skel.chainColPtr[targetLump];
+      int64_t end = sym.skel.chainColPtr[targetLump + 1];
+      stream.dispatch(
+          metalPipeline("set_span_to_chain_offset_float"),
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
+                        offset:0
+                       atIndex:0];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                        offset:0
+                       atIndex:1];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)devSpanToChainOffset.buffer()
+                        offset:0
+                       atIndex:2];
+            [encoder setBytes:&begin length:sizeof(int64_t) atIndex:3];
+            [encoder setBytes:&end length:sizeof(int64_t) atIndex:4];
+          },
+          (NSUInteger)(end - begin));
     }
-
-    // Copy to device
-    memcpy(devSpanToChainOffset.ptr(), spanToChainOffset.data(),
-           spanToChainOffset.size() * sizeof(int64_t));
   }
 
   virtual void assemble(float* data, int64_t rectRowBegin, int64_t dstStride,
@@ -496,8 +877,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       // This matches CPU ref where startRow = pChainRowsTillEnd[-1] after offsetting the pointer
       int64_t startRow = (srcColDataOffset > 0) ? sym.skel.chainRowsTillEnd[srcColDataOffset - 1] : 0;
 
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      stream.dispatch(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBytes:&numBlockRows length:sizeof(int64_t) atIndex:0];
             [encoder setBytes:&numBlockCols length:sizeof(int64_t) atIndex:1];
@@ -528,13 +909,15 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   int64_t numSpans_;
   MetalMirror<float> tempBuffer;
   MetalMirror<int64_t> devSpanToChainOffset;
-  std::vector<int64_t> spanToChainOffset;
+  MetalMirror<int32_t> potrfStatus;  // set to 1 by potrf on non positive definite blocks
+  MetalStream stream;                // last: destroyed (and flushed) before the buffers
 };
 
 // Solve context for float - Metal implementation
 template <>
 struct MetalSolveCtx<float> : SolveCtx<float> {
-  MetalSolveCtx(MetalSymbolicCtx& sym_, int nRHS_) : sym(sym_), nRHS(nRHS_) {
+  MetalSolveCtx(MetalSymbolicCtx& sym_, int nRHS_)
+      : sym(sym_), nRHS(nRHS_), stream(sym_.commandQueue) {
     // Allocate temp buffer for vector assembly
     tempVecBuffer.resizeToAtLeast(sym.skel.order() * nRHS);
   }
@@ -567,8 +950,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
               "sparseElim_diagSolveL_float");
 
       int64_t nRHS64 = nRHS;
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      stream.dispatch(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
@@ -589,8 +972,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
         id<MTLComputePipelineState> subPipeline =
             (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
                 "sparseElim_subDiagMult_float");
-        dispatchKernel(
-            sym.commandQueue, subPipeline,
+        stream.dispatch(
+            subPipeline,
             ^(id<MTLComputeCommandEncoder> encoder) {
               [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
                           offset:0
@@ -646,8 +1029,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
         id<MTLComputePipelineState> subPipeline =
             (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
                 "sparseElim_subDiagMultT_float");
-        dispatchKernel(
-            sym.commandQueue, subPipeline,
+        stream.dispatch(
+            subPipeline,
             ^(id<MTLComputeCommandEncoder> encoder) {
               [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
                           offset:0
@@ -679,8 +1062,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
           (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
               "sparseElim_diagSolveLt_float");
 
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      stream.dispatch(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
@@ -698,65 +1081,33 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     }
   }
 
+  // D += alpha * A * C, A the symmetric n x n block at offset (lower half stored)
   virtual void symm(const float* data, int64_t offset, int64_t n, const float* C, int64_t offC,
                     int64_t ldc, float* D, int64_t ldd, float alpha) override {
-    @autoreleasepool {
-      if (n <= 0 || nRHS <= 0) return;
-
-      // Use row-major for data buffer (matches CpuBaseSolveCtx)
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-      using OuterStridedCMajMatK =
-          Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                     OuterStride>;
-      using OuterStridedCMajMatM =
-          Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                     OuterStride>;
-
-      Eigen::Map<const MatRMaj> matA(data + offset, n, n);
-      OuterStridedCMajMatK matC(C + offC, n, nRHS, OuterStride(ldc));
-      OuterStridedCMajMatM matD(D + offC, n, nRHS, OuterStride(ldd));
-      matD.noalias() += alpha * (MatRMaj(matA.template selfadjointView<Eigen::Lower>()) * matC);
-    }
+    if (n <= 0 || nRHS <= 0) return;
+    MetalBufRef d = findMetalBuf(data, "MetalSolveCtx<float>::symm");
+    MetalBufRef c = findMetalBuf(C, "MetalSolveCtx<float>::symm");
+    MetalBufRef dst = findMetalBuf(D, "MetalSolveCtx<float>::symm");
+    MetalDense::symm(stream, d, offset, n, c, offC, ldc, dst, ldd, nRHS, alpha);
   }
 
   virtual void solveL(const float* data, int64_t offset, int64_t n, float* C, int64_t offC,
                       int64_t ldc) override {
-    @autoreleasepool {
-      if (n <= 0 || nRHS <= 0) return;
-
-      // Use row-major for data buffer (matches CpuBaseSolveCtx)
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-      using OuterStridedCMajMatM =
-          Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                     OuterStride>;
-
-      Eigen::Map<const MatRMaj> matA(data + offset, n, n);
-      OuterStridedCMajMatM matC(C + offC, n, nRHS, OuterStride(ldc));
-      matA.template triangularView<Eigen::Lower>().solveInPlace(matC);
-    }
+    if (n <= 0 || nRHS <= 0) return;
+    MetalBufRef d = findMetalBuf(data, "MetalSolveCtx<float>::solveL");
+    MetalBufRef c = findMetalBuf(C, "MetalSolveCtx<float>::solveL");
+    MetalDense::solveL(stream, d, offset, n, c, offC, ldc, nRHS);
   }
 
+  // tempVecBuffer (nRows x nRHS, row-major) = alpha * M * A, M the nRows x nCols block at offset
   virtual void gemv(const float* data, int64_t offset, int64_t nRows, int64_t nCols, const float* A,
                     int64_t offA, int64_t lda, float alpha) override {
-    @autoreleasepool {
-      if (nRows <= 0 || nCols <= 0 || nRHS <= 0) return;
-
-      // Use row-major for data buffer (matches CpuBaseSolveCtx)
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-      using OuterStridedCMajMatK =
-          Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                     OuterStride>;
-
-      tempVecBuffer.resizeToAtLeast(nRows * nRHS);
-
-      Eigen::Map<const MatRMaj> matM(data + offset, nRows, nCols);
-      OuterStridedCMajMatK matA(A + offA, nCols, nRHS, OuterStride(lda));
-      Eigen::Map<MatRMaj> matC(tempVecBuffer.ptr(), nRows, nRHS);
-      matC.noalias() = alpha * (matM * matA);
-    }
+    if (nRows <= 0 || nCols <= 0 || nRHS <= 0) return;
+    tempVecBuffer.resizeToAtLeast(nRows * nRHS);
+    MetalBufRef d = findMetalBuf(data, "MetalSolveCtx<float>::gemv");
+    MetalBufRef a = findMetalBuf(A, "MetalSolveCtx<float>::gemv");
+    MetalBufRef temp{(__bridge id<MTLBuffer>)tempVecBuffer.buffer(), 0};
+    MetalDense::gemv(stream, d, offset, nRows, nCols, a, offA, lda, nRHS, alpha, temp);
   }
 
   virtual void assembleVec(int64_t chainColPtr, int64_t numColItems, float* C, int64_t ldc) override {
@@ -779,8 +1130,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
           (chainColPtr > 0) ? sym.devChainRowsTillEnd.ptr()[chainColPtr - 1] : 0;
 
       int64_t nRHS64 = nRHS;
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      stream.dispatch(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
                         offset:chainColPtr * sizeof(int64_t)
@@ -802,39 +1153,20 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
 
   virtual void solveLt(const float* data, int64_t offset, int64_t n, float* C, int64_t offC,
                        int64_t ldc) override {
-    @autoreleasepool {
-      if (n <= 0 || nRHS <= 0) return;
-
-      // Use row-major for data buffer (matches CpuBaseSolveCtx)
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-      using OuterStridedCMajMatM =
-          Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                     OuterStride>;
-
-      Eigen::Map<const MatRMaj> matA(data + offset, n, n);
-      OuterStridedCMajMatM matC(C + offC, n, nRHS, OuterStride(ldc));
-      matA.template triangularView<Eigen::Lower>().adjoint().solveInPlace(matC);
-    }
+    if (n <= 0 || nRHS <= 0) return;
+    MetalBufRef d = findMetalBuf(data, "MetalSolveCtx<float>::solveLt");
+    MetalBufRef c = findMetalBuf(C, "MetalSolveCtx<float>::solveLt");
+    MetalDense::solveLt(stream, d, offset, n, c, offC, ldc, nRHS);
   }
 
+  // A += alpha * M^T * tempVecBuffer, M the nRows x nCols block at offset
   virtual void gemvT(const float* data, int64_t offset, int64_t nRows, int64_t nCols, float* A,
                      int64_t offA, int64_t lda, float alpha) override {
-    @autoreleasepool {
-      if (nRows <= 0 || nCols <= 0 || nRHS <= 0) return;
-
-      // Use row-major for data buffer (matches CpuBaseSolveCtx)
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-      using OuterStridedCMajMatM =
-          Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                     OuterStride>;
-
-      Eigen::Map<const MatRMaj> matM(data + offset, nRows, nCols);
-      OuterStridedCMajMatM matA(A + offA, nCols, nRHS, OuterStride(lda));
-      Eigen::Map<const MatRMaj> matC(tempVecBuffer.ptr(), nRows, nRHS);
-      matA.noalias() += alpha * (matM.transpose() * matC);
-    }
+    if (nRows <= 0 || nCols <= 0 || nRHS <= 0) return;
+    MetalBufRef d = findMetalBuf(data, "MetalSolveCtx<float>::gemvT");
+    MetalBufRef a = findMetalBuf(A, "MetalSolveCtx<float>::gemvT");
+    MetalBufRef temp{(__bridge id<MTLBuffer>)tempVecBuffer.buffer(), 0};
+    MetalDense::gemvT(stream, d, offset, nRows, nCols, a, offA, lda, nRHS, alpha, temp);
   }
 
   virtual void assembleVecT(const float* C, int64_t ldc, int64_t chainColPtr,
@@ -858,8 +1190,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
           (chainColPtr > 0) ? sym.devChainRowsTillEnd.ptr()[chainColPtr - 1] : 0;
 
       int64_t nRHS64 = nRHS;
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      stream.dispatch(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
                         offset:chainColPtr * sizeof(int64_t)
@@ -882,6 +1214,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
   MetalSymbolicCtx& sym;
   int nRHS;
   MetalMirror<float> tempVecBuffer;
+  MetalStream stream;  // last: destroyed (and flushed) before the buffers
 };
 
 // Batched numeric context for float

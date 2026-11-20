@@ -44,6 +44,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <cstdio>
 #include <mutex>
 #include <stdexcept>
@@ -54,7 +55,7 @@
 namespace BaSpaCho {
 
 // Dense products (syrk/gemm) with m*n*k at least this are run with MetalPerformanceShaders,
-// smaller ones with Eigen on the CPU (over the shared memory)
+// smaller ones with a Metal kernel
 constexpr int64_t kMetalMpsGemmMinOps = 64 * 64 * 64;
 
 // Number of dense products run with MetalPerformanceShaders so far (diagnostics, tests)
@@ -90,8 +91,15 @@ class MetalContext {
   void* commandQueue();  // Returns id<MTLCommandQueue>
   void* library();       // Returns id<MTLLibrary>
 
-  // Wait for all GPU operations to complete
+  // Wait for all GPU operations to complete, including the work recorded (and not committed
+  // yet) by the numeric/solve contexts. Called by MetalMirror::get/load, so that the data read
+  // or written by the CPU is consistent with the GPU work issued so far (as cudaMemcpy)
   void synchronize();
+
+  // Register/unregister a callback committing and waiting for the work recorded by a context
+  // (called by synchronize). Contexts are not thread safe, as on the other backends
+  void addPendingWorkFlusher(void* key, std::function<void()> flusher);
+  void removePendingWorkFlusher(void* key);
 
   // Get a compute pipeline state for a kernel function
   void* getPipelineState(const char* functionName);  // Returns id<MTLComputePipelineState>

@@ -23,5 +23,6 @@ add_baspacho_test(MetalFactorTest MetalFactorTest.cpp)
 add_baspacho_test(MetalSolveTest MetalSolveTest.cpp)
 add_baspacho_test(MetalPartialTest MetalPartialTest.cpp)
 add_baspacho_test(MetalSolverTest MetalSolverTest.cpp)
+add_baspacho_test(MetalDenseTest MetalDenseTest.cpp)
 # batched (std::vector<float*>) Metal operations are not implemented yet
 endif()

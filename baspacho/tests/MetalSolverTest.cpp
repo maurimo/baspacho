@@ -14,6 +14,7 @@
 #include <gtest/gtest.h>
 #include <Eigen/Dense>
 #include <algorithm>
+#include <chrono>
 #include <random>
 #include <utility>
 #include <vector>
@@ -181,7 +182,13 @@ struct Errors {
   double factor;    // |L - Lref| / |Lref| (lower triangle)
   double solution;  // |x - xref| / |xref|
   double residual;  // |A x - b| / |b|
+  double factorMs;  // time of factor (second run, after warm-up), informative only
+  double solveMs;   // time of solve (second run)
 };
+
+double msSince(chrono::steady_clock::time_point t0) {
+  return chrono::duration<double, milli>(chrono::steady_clock::now() - t0).count();
+}
 
 // factor + solve, either on host memory (CPU backends) or on Metal buffers
 Errors factorSolveErrors(BackendType backend, const Problem& prob, int nRHS, int64_t seed,
@@ -207,18 +214,34 @@ Errors factorSolveErrors(BackendType backend, const Problem& prob, int nRHS, int
   MatD b = Eigen::Map<Eigen::MatrixXf>(rhs.data(), order, nRHS).cast<double>();
   MatD xRef = llt.solve(b);
 
-  vector<float> x = rhs;
-  if (backend == BackendMetal) {
+  // run twice (the first run includes one-time costs such as the creation of the pipelines),
+  // errors are computed on the result of the second run, which is timed
+  const vector<float> data0 = data;
+  vector<float> x;
+  double factorMs = 0, solveMs = 0;
+  for (int run = 0; run < 2; run++) {
+    data = data0;
+    x = rhs;
+    if (backend == BackendMetal) {
 #ifdef BASPACHO_USE_METAL
-    MetalMirror<float> dataGpu(data), xGpu(x);
-    solver->factor(dataGpu.ptr());
-    solver->solve(dataGpu.ptr(), xGpu.ptr(), order, nRHS);
-    dataGpu.get(data);
-    xGpu.get(x);
+      MetalMirror<float> dataGpu(data), xGpu(x);
+      auto t0 = chrono::steady_clock::now();
+      solver->factor(dataGpu.ptr());
+      factorMs = msSince(t0);
+      t0 = chrono::steady_clock::now();
+      solver->solve(dataGpu.ptr(), xGpu.ptr(), order, nRHS);
+      solveMs = msSince(t0);
+      dataGpu.get(data);
+      xGpu.get(x);
 #endif
-  } else {
-    solver->factor(data.data());
-    solver->solve(data.data(), x.data(), order, nRHS);
+    } else {
+      auto t0 = chrono::steady_clock::now();
+      solver->factor(data.data());
+      factorMs = msSince(t0);
+      t0 = chrono::steady_clock::now();
+      solver->solve(data.data(), x.data(), order, nRHS);
+      solveMs = msSince(t0);
+    }
   }
 
   MatD L = MatD(solver->skel().densify(data).cast<double>()).triangularView<Eigen::Lower>();
@@ -227,6 +250,8 @@ Errors factorSolveErrors(BackendType backend, const Problem& prob, int nRHS, int
   e.factor = (L - Lref).norm() / Lref.norm();
   e.solution = (xm - xRef).norm() / xRef.norm();
   e.residual = (A * xm - b).norm() / b.norm();
+  e.factorMs = factorMs;
+  e.solveMs = solveMs;
   if (keep) {
     *keep = std::move(solver);
   }
@@ -238,7 +263,8 @@ constexpr double kFactorTol = 2e-5;
 constexpr double kSolveTol = 2e-5;
 
 void checkErrors(const Errors& e, const char* what) {
-  printf("%s: factor %.2e, solution %.2e, residual %.2e\n", what, e.factor, e.solution, e.residual);
+  printf("%s: factor %.2e, solution %.2e, residual %.2e (time: factor %.1f ms, solve %.1f ms)\n",
+         what, e.factor, e.solution, e.residual, e.factorMs, e.solveMs);
   EXPECT_LT(e.factor, kFactorTol) << what;
   EXPECT_LT(e.solution, kSolveTol) << what;
   EXPECT_LT(e.residual, kSolveTol) << what;
@@ -277,10 +303,11 @@ TEST(MetalSolver, Grid3d_MpsGemm) {
   SolverPtr solver;
   checkErrors(factorSolveErrors(BackendMetal, makeGrid3d(9, 3), 2, 5, &solver), "metal grid3d");
   int64_t expected = countLargeProducts(solver->skel(), kMetalMpsGemmMinOps);
-  int64_t done = metalMpsGemmCount() - before;
-  printf("MPS gemm calls: %lld (expected %lld)\n", (long long)done, (long long)expected);
+  int64_t done = metalMpsGemmCount() - before;  // factorSolveErrors factors twice
+  printf("MPS gemm calls: %lld in 2 factorizations (expected %lld each)\n", (long long)done,
+         (long long)expected);
   EXPECT_GT(expected, 0) << "test problem too small to exercise the MPS path";
-  EXPECT_EQ(done, expected);
+  EXPECT_EQ(done, 2 * expected);
 }
 
 // the Metal backend is float-only: double must be rejected with an exception
