@@ -42,8 +42,10 @@ struct MetalLevelSolveParams {
   int64_t ldc;       // vectors are column-major (stride ldc, nRHS columns)
   int64_t nRHS;
   int64_t transpose;  // solve with L^T
+  int64_t maxDiag;    // level_diag_solve_float skips the lumps larger than this
+  int64_t rowChunk;   // level_update_float: rows of a lump per threadgroup (y = chunk index)
 };
-static_assert(sizeof(MetalLevelSolveParams) == 7 * 8, "MetalLevelSolveParams layout");
+static_assert(sizeof(MetalLevelSolveParams) == 9 * 8, "MetalLevelSolveParams layout");
 
 // The blocks below the diagonal, by rows: for span s, the chains with row span s are
 // chain[ptr[s]], ..., chain[ptr[s + 1] - 1], in the columns of lumps lump[...] (sorted)
@@ -154,9 +156,22 @@ struct MetalSolveLevels {
 
 // Kernels of the level solve (see MetalKernels.metal)
 enum class MetalLevelKernel {
-  Update,     // level_update_float: the update of the rows of each lump
-  DiagSolve,  // level_diag_solve_float: the solve with the diagonal block of each lump
+  Update,          // level_update_float: the update of the rows of each lump
+  DiagSolve,       // level_diag_solve_float: the solve with the diagonal block of each lump
+  LargeDiagSolve,  // the solve with the diagonal block of a large lump, by the tiled kernels
 };
+
+// A dispatch of the level solve: threadgroups (groupsX, groupsY) of `threads` threads, or the
+// tiled solve of `lump` for LargeDiagSolve
+struct MetalLevelDispatch {
+  MetalLevelKernel kernel;
+  MetalLevelSolveParams params;
+  int64_t groupsX, groupsY, threads;
+  int64_t lump;
+};
+
+// Rows of a lump updated by a threadgroup of level_update_float (large lumps are split)
+constexpr int64_t kMetalLevelRowChunk = 64;
 
 // Threads per threadgroup for lumps up to maxLumpSize: a power of 2 in [32, 256], covering the
 // diagonal tiles (up to 64 rows) for up to 4 right hand sides at once
@@ -171,51 +186,80 @@ inline int64_t metalLevelThreads(int64_t maxLumpSize, int64_t nRHS) {
 
 // Runs the solve with L (or L^T if transpose) of the lumps in [lumpsBegin, lumpsEnd), as the
 // per-lump loops in Solver::internalSolveLRange (internalSolveLtRange). The levels must have been
-// computed from lumpsBegin. Calls launch(kernel, params, numThreadgroups, threadsPerThreadgroup)
-// for each dispatch, in order
+// computed from lumpsBegin. For each level:
+// - the rows of its lumps are updated (one dispatch, large lumps split in chunks of rows)
+// - the lumps up to maxDiag rows are solved with their diagonal block (one dispatch, one
+//   threadgroup per lump), the larger ones by the tiled kernels (which use many threadgroups)
+// Calls launch(const MetalLevelDispatch&) for each dispatch, in order
 template <typename Launch>
 void metalLevelSolve(const CoalescedBlockMatrixSkel& skel, const MetalSolveLevels& levels,
                      bool transpose, int64_t lumpsBegin, int64_t lumpsEnd, int64_t ldc,
-                     int64_t nRHS, Launch&& launch) {
+                     int64_t nRHS, int64_t maxDiag, Launch&& launch) {
   BASPACHO_CHECK_LE(lumpsBegin, lumpsEnd);
   const int64_t numLumps = skel.numLumps();
-  auto maxLumpSize = [&](auto lumpAt, int64_t n) {
-    int64_t retv = 0;
-    for (int64_t i = 0; i < n; i++) {
-      int64_t l = lumpAt(i);
-      retv = std::max(retv, skel.lumpStart[l + 1] - skel.lumpStart[l]);
-    }
-    return retv;
-  };
+  auto lumpSize = [&](int64_t l) { return skel.lumpStart[l + 1] - skel.lumpStart[l]; };
 
-  MetalLevelSolveParams p = {};
+  MetalLevelDispatch d = {};
+  MetalLevelSolveParams& p = d.params;
   p.useList = 1;
   p.srcBegin = lumpsBegin;
   p.srcEnd = lumpsEnd;
   p.ldc = ldc;
   p.nRHS = nRHS;
   p.transpose = transpose ? 1 : 0;
+  p.maxDiag = maxDiag;
+  p.rowChunk = kMetalLevelRowChunk;
+  auto update = [&](int64_t numLumps, int64_t maxSize) {
+    d.kernel = MetalLevelKernel::Update;
+    d.groupsX = numLumps;
+    d.groupsY = (maxSize + kMetalLevelRowChunk - 1) / kMetalLevelRowChunk;
+    d.threads = metalLevelThreads(maxSize, nRHS);
+    launch(d);
+  };
+
   for (int64_t lv = 0; lv < levels.numLevels(); lv++) {
     auto [a, b] = levels.levelRange(lv, lumpsBegin, lumpsEnd);
     if (a == b) {
       continue;
     }
-    int64_t nth =
-        metalLevelThreads(maxLumpSize([&](int64_t i) { return levels.lumps[a + i]; }, b - a), nRHS);
+    int64_t maxSize = 0, maxSmallSize = 0;
+    for (int64_t i = a; i < b; i++) {
+      int64_t n = lumpSize(levels.lumps[i]);
+      maxSize = std::max(maxSize, n);
+      if (n <= maxDiag) {
+        maxSmallSize = std::max(maxSmallSize, n);
+      }
+    }
     p.listOff = a;
     if (lv > 0) {  // lumps in level 0 have no update (nothing before them / below them)
-      launch(MetalLevelKernel::Update, p, b - a, nth);
+      update(b - a, maxSize);
     }
-    launch(MetalLevelKernel::DiagSolve, p, b - a, nth);
+    if (maxSmallSize > 0) {
+      d.kernel = MetalLevelKernel::DiagSolve;
+      d.groupsX = b - a;
+      d.groupsY = 1;
+      d.threads = metalLevelThreads(maxSmallSize, nRHS);
+      launch(d);
+    }
+    for (int64_t i = a; i < b; i++) {
+      if (lumpSize(levels.lumps[i]) > maxDiag) {
+        d.kernel = MetalLevelKernel::LargeDiagSolve;
+        d.lump = levels.lumps[i];
+        d.groupsX = d.groupsY = d.threads = 0;
+        launch(d);
+      }
+    }
   }
 
   // solve with L: the rows after lumpsEnd are updated with the solved lumps (not solved)
   if (!transpose && lumpsBegin < lumpsEnd && lumpsEnd < numLumps) {
     p.useList = 0;
     p.listOff = lumpsEnd;
-    int64_t nth = metalLevelThreads(
-        maxLumpSize([&](int64_t i) { return lumpsEnd + i; }, numLumps - lumpsEnd), nRHS);
-    launch(MetalLevelKernel::Update, p, numLumps - lumpsEnd, nth);
+    int64_t maxSize = 0;
+    for (int64_t l = lumpsEnd; l < numLumps; l++) {
+      maxSize = std::max(maxSize, lumpSize(l));
+    }
+    update(numLumps - lumpsEnd, maxSize);
   }
 }
 

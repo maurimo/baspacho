@@ -114,29 +114,51 @@ static void checkLevels(const CoalescedBlockMatrixSkel& skel, int64_t begin, boo
 
 // Runs metalLevelSolve recording the dispatches, and checks their order
 static void checkDispatches(const CoalescedBlockMatrixSkel& skel, int64_t begin, int64_t end,
-                            bool transpose) {
+                            bool transpose, int64_t maxDiag) {
   MetalSolveLevels lv = transpose ? MetalSolveLevels::backward(skel, begin)
                                   : MetalSolveLevels::forward(skel, begin);
   const int64_t numLumps = skel.numLumps();
+  auto lumpSize = [&](int64_t l) { return skel.lumpStart[l + 1] - skel.lumpStart[l]; };
   vector<int64_t> solvedAt(numLumps, -1), updatedAt(numLumps, -1);
+  vector<vector<int64_t>> rowsUpdatedAt(numLumps);  // per row of the lump
+  for (int64_t l = 0; l < numLumps; l++) {
+    rowsUpdatedAt[l].assign(lumpSize(l), -1);
+  }
   int64_t dispatch = 0;
-  metalLevelSolve(skel, lv, transpose, begin, end, /* ldc = */ 100, /* nRHS = */ 3,
-                  [&](MetalLevelKernel k, const MetalLevelSolveParams& p, int64_t numGroups,
-                      int64_t nth) {
+  metalLevelSolve(skel, lv, transpose, begin, end, /* ldc = */ 100, /* nRHS = */ 3, maxDiag,
+                  [&](const MetalLevelDispatch& d) {
+                    const MetalLevelSolveParams& p = d.params;
                     EXPECT_EQ(p.srcBegin, begin);
                     EXPECT_EQ(p.srcEnd, end);
                     EXPECT_EQ(p.transpose, transpose ? 1 : 0);
-                    EXPECT_GE(nth, 32);
-                    EXPECT_LE(nth, 256);
-                    EXPECT_GT(numGroups, 0);
-                    for (int64_t g = 0; g < numGroups; g++) {
+                    EXPECT_EQ(p.maxDiag, maxDiag);
+                    if (d.kernel == MetalLevelKernel::LargeDiagSolve) {
+                      EXPECT_GT(lumpSize(d.lump), maxDiag);
+                      EXPECT_EQ(solvedAt[d.lump], -1);
+                      solvedAt[d.lump] = dispatch++;
+                      return;
+                    }
+                    EXPECT_GE(d.threads, 32);
+                    EXPECT_LE(d.threads, 256);
+                    EXPECT_GT(d.groupsX, 0);
+                    EXPECT_GT(d.groupsY, 0);
+                    for (int64_t g = 0; g < d.groupsX; g++) {
                       int64_t l = p.useList ? lv.lumps[p.listOff + g] : p.listOff + g;
                       ASSERT_GE(l, 0);
                       ASSERT_LT(l, numLumps);
-                      if (k == MetalLevelKernel::Update) {
-                        EXPECT_EQ(updatedAt[l], -1);
+                      if (d.kernel == MetalLevelKernel::Update) {
+                        // threadgroup (g, y) updates rows [y * rowChunk, (y + 1) * rowChunk)
+                        for (int64_t y = 0; y < d.groupsY; y++) {
+                          for (int64_t r = y * p.rowChunk;
+                               r < std::min((y + 1) * p.rowChunk, lumpSize(l)); r++) {
+                            EXPECT_EQ(rowsUpdatedAt[l][r], -1);
+                            rowsUpdatedAt[l][r] = dispatch;
+                          }
+                        }
+                        EXPECT_GE(d.groupsY * p.rowChunk, lumpSize(l));
                         updatedAt[l] = dispatch;
-                      } else {
+                      } else if (lumpSize(l) <= maxDiag) {  // larger ones are skipped
+                        EXPECT_EQ(d.groupsY, 1);
                         EXPECT_TRUE(p.useList);
                         EXPECT_EQ(solvedAt[l], -1);
                         solvedAt[l] = dispatch;
@@ -145,8 +167,13 @@ static void checkDispatches(const CoalescedBlockMatrixSkel& skel, int64_t begin,
                     dispatch++;
                   });
 
-  // every lump in [begin, end) is solved, the others aren't
+  // every lump in [begin, end) is solved, the others aren't; updates cover all the rows
   for (int64_t l = 0; l < numLumps; l++) {
+    if (updatedAt[l] >= 0) {
+      for (int64_t r = 0; r < lumpSize(l); r++) {
+        EXPECT_EQ(rowsUpdatedAt[l][r], updatedAt[l]) << "lump " << l << " row " << r;
+      }
+    }
     if (l >= begin && l < end) {
       EXPECT_GE(solvedAt[l], 0) << "lump " << l;
       if (updatedAt[l] >= 0) {
@@ -186,7 +213,9 @@ static void testSkel(const CoalescedBlockMatrixSkel& skel) {
       checkLevels(skel, begin, transpose);
       for (int64_t end : cuts) {
         if (end >= begin) {
-          checkDispatches(skel, begin, end, transpose);
+          for (int64_t maxDiag : {int64_t(1) << 40, int64_t(8), int64_t(0)}) {
+            checkDispatches(skel, begin, end, transpose, maxDiag);
+          }
         }
       }
     }

@@ -93,5 +93,5 @@ jobs:
         run: |
           # the end-to-end tests print the measured relative errors and MPS usage
           ./build/baspacho/tests/MetalSolverTest 2>&1 | tee solver.log || true
-          grep -E "^(metal|fast) .*: factor|^MPS gemm calls" solver.log | \
+          grep -E "^(metal|fast) .*: factor|^MPS gemm calls|^lump bench" solver.log | \
             while read -r line; do echo "::notice title=MetalSolverTest ${{ matrix.os }}::$line"; done

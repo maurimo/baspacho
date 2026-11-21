@@ -69,6 +69,16 @@ struct MetalStats {
 };
 MetalStats metalStats();
 
+// Options of the solves (for benchmarks and tests, not thread safe; the defaults are tuned)
+struct MetalSolveOptions {
+  // solve the dense lumps level by level (see MetalSolveLevels.h), else lump by lump
+  bool levelSolve = true;
+  // in the level solve, the lumps larger than this are solved with their diagonal block by the
+  // tiled kernels (many threadgroups) instead of one threadgroup per lump
+  int64_t levelMaxDiagLump = 256;
+};
+MetalSolveOptions& metalSolveOptions();
+
 // Error checking for Metal operations: throws std::runtime_error (the process can recover, eg.
 // falling back to another backend)
 #define mtlCHECK(condition, msg)                                                               \

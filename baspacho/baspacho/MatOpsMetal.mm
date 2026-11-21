@@ -199,6 +199,11 @@ int64_t metalMpsGemmCount() { return mpsGemmCount.load(); }
 static std::atomic<int64_t> statDispatches{0};
 static std::atomic<int64_t> statCommandBuffers{0};
 static std::atomic<int64_t> statGpuNanoseconds{0};
+MetalSolveOptions& metalSolveOptions() {
+  static MetalSolveOptions options;
+  return options;
+}
+
 MetalStats metalStats() {
   return MetalStats{statDispatches.load(), statCommandBuffers.load(),
                     statGpuNanoseconds.load() * 1e-9};
@@ -1171,6 +1176,9 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
   // MetalSolveLevels.h: a couple of dispatches per level, instead of a few per lump
   bool levelSolve(const float* data, int64_t lumpsBegin, int64_t lumpsEnd, float* C, int64_t ldc,
                   bool transpose) {
+    if (!metalSolveOptions().levelSolve) {
+      return false;  // lump by lump
+    }
     if (lumpsBegin >= lumpsEnd || nRHS <= 0) {
       return true;
     }
@@ -1193,13 +1201,24 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     };
     id<MTLComputePipelineState> updatePipeline = metalPipeline("level_update_float");
     id<MTLComputePipelineState> diagPipeline = metalPipeline("level_diag_solve_float");
+    const CoalescedBlockMatrixSkel& skel = sym.skel;
     metalLevelSolve(
-        sym.skel, transpose ? lv.bwd : lv.fwd, transpose, lumpsBegin, lumpsEnd, ldc, nRHS,
-        [&](MetalLevelKernel kernel, const MetalLevelSolveParams& params, int64_t numGroups,
-            int64_t numThreads) {
-          const MetalLevelSolveParams prm = params;
+        skel, transpose ? lv.bwd : lv.fwd, transpose, lumpsBegin, lumpsEnd, ldc, nRHS,
+        metalSolveOptions().levelMaxDiagLump, [&](const MetalLevelDispatch& dsp) {
+          if (dsp.kernel == MetalLevelKernel::LargeDiagSolve) {
+            int64_t lumpStart = skel.lumpStart[dsp.lump];
+            int64_t n = skel.lumpStart[dsp.lump + 1] - lumpStart;
+            int64_t diagOff = skel.chainData[skel.chainColPtr[dsp.lump]];
+            if (transpose) {
+              MetalDense::solveLt(stream, d, diagOff, n, c, lumpStart, ldc, nRHS);
+            } else {
+              MetalDense::solveL(stream, d, diagOff, n, c, lumpStart, ldc, nRHS);
+            }
+            return;
+          }
+          const MetalLevelSolveParams prm = dsp.params;
           stream.dispatchGroups(
-              kernel == MetalLevelKernel::Update ? updatePipeline : diagPipeline,
+              dsp.kernel == MetalLevelKernel::Update ? updatePipeline : diagPipeline,
               ^(id<MTLComputeCommandEncoder> encoder) {
                 for (size_t i = 0; i < idx.size(); i++) {
                   [encoder setBuffer:idx[i] offset:0 atIndex:i];
@@ -1209,7 +1228,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                 [encoder setBuffer:c.buf offset:c.off atIndex:12];
                 [encoder setBytes:&prm length:sizeof(prm) atIndex:13];
               },
-              MTLSizeMake(numGroups, 1, 1), MTLSizeMake(numThreads, 1, 1));
+              MTLSizeMake(dsp.groupsX, dsp.groupsY, 1), MTLSizeMake(dsp.threads, 1, 1));
         });
     return true;
   }
