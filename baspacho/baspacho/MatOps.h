@@ -173,6 +173,22 @@ struct SolveCtx : SolveCtxBase {
 
   virtual void assembleVecT(const T* C, int64_t ldc, int64_t chainColPtr, int64_t numColItems) = 0;
 
+  // Optional: solves with L the dense lumps in [lumpsBegin, lumpsEnd) and updates the rows below
+  // them, ie the same as the loop of solveL/gemv/assembleVec on each lump in Solver, in a way
+  // chosen by the backend (eg. processing independent lumps together). Returns false if not
+  // implemented (the default), in which case the Solver runs the per-lump ops.
+  virtual bool solveLRange(const T* /*data*/, int64_t /*lumpsBegin*/, int64_t /*lumpsEnd*/,
+                           T* /*C*/, int64_t /*ldc*/) {
+    return false;
+  }
+
+  // Optional: as solveLRange, for the solve with L^T of the dense lumps in [lumpsBegin, lumpsEnd)
+  // (the loop of assembleVecT/gemvT/solveLt on each lump, from the last one, in Solver)
+  virtual bool solveLtRange(const T* /*data*/, int64_t /*lumpsBegin*/, int64_t /*lumpsEnd*/,
+                            T* /*C*/, int64_t /*ldc*/) {
+    return false;
+  }
+
   virtual bool hasFragmentedOps() { return false; }
 
   virtual void fragmentedMV(const T* /*data*/, const T* /*x*/, int64_t /*spanBegin*/,

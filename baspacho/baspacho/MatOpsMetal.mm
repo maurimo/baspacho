@@ -9,9 +9,12 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <iostream>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <typeindex>
@@ -20,6 +23,7 @@
 #include "baspacho/baspacho/DebugMacros.h"
 #include "baspacho/baspacho/MatOps.h"
 #include "baspacho/baspacho/MetalDefs.h"
+#include "baspacho/baspacho/MetalSolveLevels.h"
 #include "baspacho/baspacho/Utils.h"
 
 namespace BaSpaCho {
@@ -74,6 +78,16 @@ struct MetalSymbolicCtx : SymbolicCtx {
       devSpanToLump.load(skel.spanToLump);
       devPermutation.load(permutation);
 
+      // blocks by rows, for the level solve (with a dummy entry if empty, buffers can't be empty)
+      MetalRowChains rowChains(skel);
+      if (rowChains.chain.empty()) {
+        rowChains.chain.push_back(0);
+        rowChains.lump.push_back(0);
+      }
+      devRowChainPtr.load(rowChains.ptr);
+      devRowChainIdx.load(rowChains.chain);
+      devRowChainLump.load(rowChains.lump);
+
       NSLog(@"MetalSymbolicCtx initialized");
     }
   }
@@ -113,6 +127,29 @@ struct MetalSymbolicCtx : SymbolicCtx {
 
   virtual SolveCtxBase* createSolveCtxForType(type_index tIdx, int nRHS, int batchSize) override;
 
+  // Levels of the solves of the lumps from `begin` on, and their lists of lumps on the GPU
+  struct SolveLevels {
+    MetalSolveLevels fwd, bwd;
+    MetalMirror<int64_t> devFwdLumps, devBwdLumps;
+  };
+
+  // computed on first use (and kept, typically begin is 0, or the start of the dense lumps)
+  const SolveLevels& solveLevels(int64_t begin) {
+    std::lock_guard<std::mutex> lock(solveLevelsMutex);
+    std::unique_ptr<SolveLevels>& lv = solveLevelsFrom[begin];
+    if (!lv) {
+      lv = std::make_unique<SolveLevels>();
+      lv->fwd = MetalSolveLevels::forward(skel, begin);
+      lv->bwd = MetalSolveLevels::backward(skel, begin);
+      std::vector<int64_t> fwdLumps = lv->fwd.lumps, bwdLumps = lv->bwd.lumps;
+      fwdLumps.push_back(0);  // not empty
+      bwdLumps.push_back(0);
+      lv->devFwdLumps.load(fwdLumps);
+      lv->devBwdLumps.load(bwdLumps);
+    }
+    return *lv;
+  }
+
   const CoalescedBlockMatrixSkel& skel;
 
   id<MTLDevice> device;
@@ -131,6 +168,12 @@ struct MetalSymbolicCtx : SymbolicCtx {
   MetalMirror<int64_t> devSpanStart;
   MetalMirror<int64_t> devSpanToLump;
   MetalMirror<int64_t> devPermutation;
+  MetalMirror<int64_t> devRowChainPtr;
+  MetalMirror<int64_t> devRowChainIdx;
+  MetalMirror<int64_t> devRowChainLump;
+
+  std::mutex solveLevelsMutex;
+  std::map<int64_t, std::unique_ptr<SolveLevels>> solveLevelsFrom;
 };
 
 // Metal operations factory
@@ -1109,6 +1152,63 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
           },
           (NSUInteger)numLumps);
     }
+  }
+
+  // Solves with L (or L^T) the lumps in [lumpsBegin, lumpsEnd) level by level, see
+  // MetalSolveLevels.h: a couple of dispatches per level, instead of a few per lump
+  bool levelSolve(const float* data, int64_t lumpsBegin, int64_t lumpsEnd, float* C, int64_t ldc,
+                  bool transpose) {
+    if (lumpsBegin >= lumpsEnd || nRHS <= 0) {
+      return true;
+    }
+    const MetalSymbolicCtx::SolveLevels& lv = sym.solveLevels(lumpsBegin);
+    MetalBufRef d = findMetalBuf(data, "MetalSolveCtx<float>::levelSolve");
+    MetalBufRef c = findMetalBuf(C, "MetalSolveCtx<float>::levelSolve");
+    id<MTLBuffer> lumpsBuf =
+        (__bridge id<MTLBuffer>)(transpose ? lv.devBwdLumps.buffer() : lv.devFwdLumps.buffer());
+    const std::array<id<MTLBuffer>, 10> idx = {
+        (__bridge id<MTLBuffer>)sym.devLumpStart.buffer(),
+        (__bridge id<MTLBuffer>)sym.devSpanStart.buffer(),
+        (__bridge id<MTLBuffer>)sym.devLumpToSpan.buffer(),
+        (__bridge id<MTLBuffer>)sym.devSpanToLump.buffer(),
+        (__bridge id<MTLBuffer>)sym.devChainColPtr.buffer(),
+        (__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer(),
+        (__bridge id<MTLBuffer>)sym.devChainData.buffer(),
+        (__bridge id<MTLBuffer>)sym.devRowChainPtr.buffer(),
+        (__bridge id<MTLBuffer>)sym.devRowChainIdx.buffer(),
+        (__bridge id<MTLBuffer>)sym.devRowChainLump.buffer(),
+    };
+    id<MTLComputePipelineState> updatePipeline = metalPipeline("level_update_float");
+    id<MTLComputePipelineState> diagPipeline = metalPipeline("level_diag_solve_float");
+    metalLevelSolve(
+        sym.skel, transpose ? lv.bwd : lv.fwd, transpose, lumpsBegin, lumpsEnd, ldc, nRHS,
+        [&](MetalLevelKernel kernel, const MetalLevelSolveParams& params, int64_t numGroups,
+            int64_t numThreads) {
+          const MetalLevelSolveParams prm = params;
+          stream.dispatchGroups(
+              kernel == MetalLevelKernel::Update ? updatePipeline : diagPipeline,
+              ^(id<MTLComputeCommandEncoder> encoder) {
+                for (size_t i = 0; i < idx.size(); i++) {
+                  [encoder setBuffer:idx[i] offset:0 atIndex:i];
+                }
+                [encoder setBuffer:lumpsBuf offset:0 atIndex:10];
+                [encoder setBuffer:d.buf offset:d.off atIndex:11];
+                [encoder setBuffer:c.buf offset:c.off atIndex:12];
+                [encoder setBytes:&prm length:sizeof(prm) atIndex:13];
+              },
+              MTLSizeMake(numGroups, 1, 1), MTLSizeMake(numThreads, 1, 1));
+        });
+    return true;
+  }
+
+  virtual bool solveLRange(const float* data, int64_t lumpsBegin, int64_t lumpsEnd, float* C,
+                           int64_t ldc) override {
+    return levelSolve(data, lumpsBegin, lumpsEnd, C, ldc, /* transpose = */ false);
+  }
+
+  virtual bool solveLtRange(const float* data, int64_t lumpsBegin, int64_t lumpsEnd, float* C,
+                            int64_t ldc) override {
+    return levelSolve(data, lumpsBegin, lumpsEnd, C, ldc, /* transpose = */ true);
   }
 
   // D += alpha * A * C, A the symmetric n x n block at offset (lower half stored)
