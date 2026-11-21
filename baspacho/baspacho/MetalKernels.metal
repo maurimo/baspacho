@@ -910,8 +910,8 @@ struct LevelSolveParams {
     device const float* data [[buffer(11)]],                              \
     device float* x [[buffer(12)]],                                       \
     constant LevelSolveParams& p [[buffer(13)]],                          \
-    uint lid [[thread_position_in_threadgroup]],                          \
-    uint nth [[threads_per_threadgroup]],                                 \
+    uint2 lid2 [[thread_position_in_threadgroup]],                        \
+    uint2 nth2 [[threads_per_threadgroup]],                               \
     uint2 tg [[threadgroup_position_in_grid]]
 
 // Update of the rows [rowBegin, rowEnd) of lump `lump` with the solved lumps:
@@ -994,6 +994,7 @@ inline int64_t levelLump(constant LevelSolveParams& p, device const int64_t* lev
 // Update of the rows of the lumps: threadgroup (x, y) updates the y-th chunk of rowChunk rows of
 // the x-th lump (see levelUpdate)
 kernel void level_update_float(LEVEL_SOLVE_ARGS) {
+    const uint lid = lid2.x, nth = nth2.x;  // 1D threadgroups (uint2: all scalar or all vectors)
     const int64_t lump = levelLump(p, levelLumps, tg.x);
     const int n = int(lumpStart[lump + 1] - lumpStart[lump]);
     const int rowBegin = int(tg.y) * int(p.rowChunk);
@@ -1019,6 +1020,7 @@ kernel void level_update_float(LEVEL_SOLVE_ARGS) {
 // Sizes are 32 bit integers, offsets in the vectors are 64 bit. Lumps larger than p.maxDiag
 // are skipped (solved by the tiled kernels, which use many threadgroups).
 kernel void level_diag_solve_float(LEVEL_SOLVE_ARGS) {
+    const uint lid = lid2.x, nth = nth2.x;  // 1D threadgroups (uint2: all scalar or all vectors)
     threadgroup float lt[kDenseTile][kDenseTile + 1];  // diagonal tile, then the blocks below
     threadgroup float xt[kLevelMaxChunk][kDenseTile];  // solved tile of x
     threadgroup float piv[2][kLevelMaxChunk];
