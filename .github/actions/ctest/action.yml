@@ -20,7 +20,7 @@ runs:
       shell: bash
       run: |
         set -o pipefail
-        ctest --test-dir "${{ inputs.build-dir }}" --output-on-failure --timeout 1800 \
+        ctest --test-dir "${{ inputs.build-dir }}" --output-on-failure --no-tests=error --timeout 1800 \
           ${{ inputs.args }} 2>&1 | tee ctest.log
     - name: annotate
       if: always()
