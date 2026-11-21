@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include "baspacho/baspacho/AnalysisParallel.h"
 #include "baspacho/baspacho/SparseStructure.h"
 
 #ifdef BASPACHO_USE_SUITESPARSE_AMD
@@ -204,9 +205,9 @@ SparseStructure SparseStructure::addIndependentEliminationFill(int64_t elimStart
   int64_t numChunks = std::min<int64_t>(numRows, 256);
   vector<vector<int64_t>> chunkInds(numChunks);
   vector<int64_t> rowSize(numRows);
-  dispenso::parallel_for(
-      dispenso::makeChunkedRange(0L, numChunks, 1L), [&](int64_t c0, int64_t c1) {
+  analysisParallelFor(0L, numChunks, 1L, [&](int64_t c0, int64_t c1) {
         vector<int64_t> tags(numRows, -1);
+        vector<int64_t> lowTags(elimEnd, -1);  // low entries already in the row
         vector<int64_t> high;
         for (int64_t c = c0; c < c1; c++) {
           int64_t kBegin = elimEnd + numRows * c / numChunks;
@@ -219,8 +220,14 @@ SparseStructure SparseStructure::addIndependentEliminationFill(int64_t elimStart
             high.push_back(k);
             for (int64_t q = ptrs[k], qEnd = ptrs[k + 1]; q < qEnd; q++) {
               int64_t i = inds[q];
-              BASPACHO_CHECK_LE(i, k);  // lower half CSR expected
+              if (i > k) {
+                continue;  // upper half entries are ignored (as the diagonal, added above)
+              }
               if (i < elimEnd) {
+                if (lowTags[i] == k) {
+                  continue;  // duplicate entry, row and fill already added
+                }
+                lowTags[i] = k;
                 out.push_back(i);
                 if (i >= elimStart) {  // walk rows of elim column i, below k
                   for (int64_t t = elimPtrs[i - elimStart], tEnd = elimPtrs[i - elimStart + 1];
@@ -264,7 +271,7 @@ SparseStructure SparseStructure::addIndependentEliminationFill(int64_t elimStart
       std::sort(retv.inds.begin() + retv.ptrs[k], retv.inds.begin() + retv.ptrs[k + 1]);
     }
   }
-  dispenso::parallel_for(dispenso::makeChunkedRange(0L, numChunks, 1L),
+  analysisParallelFor(0L, numChunks, 1L,
                          [&](int64_t c0, int64_t c1) {
                            for (int64_t c = c0; c < c1; c++) {
                              int64_t kBegin = elimEnd + numRows * c / numChunks;
