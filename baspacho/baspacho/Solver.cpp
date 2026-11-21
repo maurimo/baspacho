@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include "baspacho/baspacho/AnalysisParallel.h"
 #include "baspacho/baspacho/Solver.h"
 #include <dispenso/parallel_for.h>
 #include <Eigen/Eigenvalues>
@@ -665,7 +666,7 @@ static void leadingColumnsOfPermuted(const SparseStructure& ss, const vector<int
     }
   }
   rewindVec(colPtr);
-  dispenso::parallel_for(dispenso::makeChunkedRange(0L, numCols, 4096L),
+  analysisParallelFor(0L, numCols, 4096L,
                          [&](int64_t c0, int64_t c1) {
                            for (int64_t c = c0; c < c1; c++) {
                              std::sort(rowInd.begin() + colPtr[c], rowInd.begin() + colPtr[c + 1]);
@@ -691,6 +692,9 @@ OpsPtr getBackend(const Settings& settings) {
 SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& paramSize,
                        const SparseStructure& ss_, const std::vector<int64_t>& sparseElimRanges,
                        const unordered_set<int64_t>& elimLastIds) {
+  // the analysis uses at most settings.numThreads threads (serial, no thread pool, with 1)
+  AnalysisThreadsScope analysisThreads(settings.numThreads);
+
   // no point in providing "elim last" ids if not allowing solve up to such set
   BASPACHO_CHECK(settings.addFillPolicy == AddFillComplete || elimLastIds.empty());
   AnalysisTimer timer("baspacho analysis");

@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include "baspacho/baspacho/AnalysisParallel.h"
 #include "baspacho/baspacho/CoalescedBlockMatrix.h"
 #include <dispenso/parallel_for.h>
 #include <iostream>
@@ -62,8 +63,7 @@ CoalescedBlockMatrixSkel::CoalescedBlockMatrixSkel(const vector<int64_t>& spanSt
   vector<int64_t> lumpDataSize(numLumps + 1, 0);
 
   constexpr int64_t kLumpChunk = 256;
-  dispenso::parallel_for(
-      dispenso::makeChunkedRange(0L, numLumps, kLumpChunk), [&](int64_t l0, int64_t l1) {
+  analysisParallelFor(0L, numLumps, kLumpChunk, [&](int64_t l0, int64_t l1) {
         for (int64_t l = l0; l < l1; l++) {
           int64_t colStart = colPtr[l];
           int64_t colEnd = colPtr[l + 1];
@@ -101,8 +101,7 @@ CoalescedBlockMatrixSkel::CoalescedBlockMatrixSkel(const vector<int64_t>& spanSt
   boardRowLump.resize(totNumBoards);
   boardChainColOrd.resize(totNumBoards);
 
-  dispenso::parallel_for(
-      dispenso::makeChunkedRange(0L, numLumps, kLumpChunk), [&](int64_t l0, int64_t l1) {
+  analysisParallelFor(0L, numLumps, kLumpChunk, [&](int64_t l0, int64_t l1) {
         for (int64_t l = l0; l < l1; l++) {
           int64_t colStart = colPtr[l];
           int64_t colEnd = colPtr[l + 1];
