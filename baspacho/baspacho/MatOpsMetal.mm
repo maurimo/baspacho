@@ -1202,9 +1202,13 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     id<MTLComputePipelineState> updatePipeline = metalPipeline("level_update_float");
     id<MTLComputePipelineState> diagPipeline = metalPipeline("level_diag_solve_float");
     const CoalescedBlockMatrixSkel& skel = sym.skel;
+    int64_t maxDiag = metalSolveOptions().levelMaxDiagLump;
+    if (maxDiag < 0) {
+      maxDiag = nRHS == 1 ? 128 : 256;
+    }
     metalLevelSolve(
         skel, transpose ? lv.bwd : lv.fwd, transpose, lumpsBegin, lumpsEnd, ldc, nRHS,
-        metalSolveOptions().levelMaxDiagLump, [&](const MetalLevelDispatch& dsp) {
+        maxDiag, [&](const MetalLevelDispatch& dsp) {
           if (dsp.kernel == MetalLevelKernel::LargeDiagSolve) {
             int64_t lumpStart = skel.lumpStart[dsp.lump];
             int64_t n = skel.lumpStart[dsp.lump + 1] - lumpStart;

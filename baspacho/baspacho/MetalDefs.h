@@ -74,8 +74,9 @@ struct MetalSolveOptions {
   // solve the dense lumps level by level (see MetalSolveLevels.h), else lump by lump
   bool levelSolve = true;
   // in the level solve, the lumps larger than this are solved with their diagonal block by the
-  // tiled kernels (many threadgroups) instead of one threadgroup per lump
-  int64_t levelMaxDiagLump = 256;
+  // tiled kernels (many threadgroups) instead of one threadgroup per lump. If negative: 128 for
+  // 1 RHS, 256 for more (from MetalSolverTest.DenseLumpSolveBench on the CI runners)
+  int64_t levelMaxDiagLump = -1;
 };
 MetalSolveOptions& metalSolveOptions();
 
