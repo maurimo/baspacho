@@ -324,3 +324,71 @@ TEST(BatchedCudaSolve, SolveL_SparseElimAndFactor_Many_double) {
 TEST(BatchedCudaSolve, SolveL_SparseElimAndFactor_Many_float) {
   testBatchedSolveL_SparseElimAndFactor_Many<float>([] { return cudaOps(); }, 5, 8);
 }
+
+// Batched ops on an empty batch are no-ops (no kernel launched with an empty grid, which would
+// leave a CUDA error), and the device is still usable by a valid batch afterwards
+template <typename T>
+void testEmptyBatch() {
+  auto colBlocks = randomCols(115, 0.03, 57);
+  colBlocks = makeIndependentElimSet(colBlocks, 0, 60);
+  SparseStructure ss = columnsToCscStruct(colBlocks).transpose();
+  vector<int64_t> paramSize = randomVec(ss.ptrs.size() - 1, 2, 5, 47);
+  EliminationTree et(paramSize, ss);
+  et.buildTree();
+  et.processTree(/* compute sparse elim ranges = */ true);
+  et.computeAggregateStruct();
+  CoalescedBlockMatrixSkel factorSkel(et.computeSpanStart(), et.lumpToSpan, et.colStart,
+                                      et.rowParam);
+  ASSERT_GE(et.sparseElimRanges.size(), 2);
+  Solver solver(move(factorSkel), move(et.sparseElimRanges), {}, cudaOps());
+  int order = solver.order();
+  int64_t mid = solver.skel().lumpToSpan[solver.skel().numLumps() / 2];
+
+  vector<T*> none;
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  solver.factor(&none);
+  solver.factorUpTo(&none, mid);
+  solver.factorFrom(&none, mid);
+  solver.solve(&none, &none, order, 2);
+  solver.solveL(&none, &none, order, 2);
+  solver.solveLt(&none, &none, order, 2);
+  solver.solveLUpTo(&none, mid, &none, order, 2);
+  solver.solveLtUpTo(&none, mid, &none, order, 2);
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  // a valid batch afterwards, on the same solver
+  const int batchSize = 3, nRHS = 2;
+  vector<vector<T>> datas(batchSize), rhsDatas(batchSize);
+  for (int q = 0; q < batchSize; q++) {
+    datas[q] = randomData<T>(solver.skel().dataSize(), -1.0, 1.0, 37 + q);
+    solver.skel().damp(datas[q], T(0), T(order * 1.3));
+    rhsDatas[q] = randomData<T>(order * nRHS, -1.0, 1.0, 137 + q);
+  }
+  vector<vector<T>> rhsDatasBackup = rhsDatas;
+  {
+    vector<DevMirror<T>> datasGpu(batchSize), rhsDatasGpu(batchSize);
+    vector<T*> datasPtr(batchSize), rhsDatasPtr(batchSize);
+    for (int q = 0; q < batchSize; q++) {
+      datasGpu[q].load(datas[q]);
+      rhsDatasGpu[q].load(rhsDatas[q]);
+      datasPtr[q] = datasGpu[q].ptr;
+      rhsDatasPtr[q] = rhsDatasGpu[q].ptr;
+    }
+    solver.solveL(&datasPtr, &rhsDatasPtr, order, nRHS);
+    for (int q = 0; q < batchSize; q++) {
+      rhsDatasGpu[q].get(rhsDatas[q]);
+    }
+  }
+  for (int q = 0; q < batchSize; q++) {
+    Matrix<T> verifyMat = solver.skel().densify(datas[q]);
+    Matrix<T> rhsVerif = verifyMat.template triangularView<Eigen::Lower>().solve(
+        Eigen::Map<Matrix<T>>(rhsDatasBackup[q].data(), order, nRHS));
+    ASSERT_NEAR((rhsVerif - Eigen::Map<Matrix<T>>(rhsDatas[q].data(), order, nRHS)).norm(), 0,
+                Epsilon<T>::value2);
+  }
+}
+
+TEST(BatchedCudaSolve, EmptyBatch_double) { testEmptyBatch<double>(); }
+
+TEST(BatchedCudaSolve, EmptyBatch_float) { testEmptyBatch<float>(); }
