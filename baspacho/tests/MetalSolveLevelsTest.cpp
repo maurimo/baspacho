@@ -133,10 +133,11 @@ static void checkDispatches(const CoalescedBlockMatrixSkel& skel, int64_t begin,
                       int64_t l = p.useList ? lv.lumps[p.listOff + g] : p.listOff + g;
                       ASSERT_GE(l, 0);
                       ASSERT_LT(l, numLumps);
-                      if (k == MetalLevelKernel::Update) {
+                      if (k == MetalLevelKernel::Update || p.update) {
                         EXPECT_EQ(updatedAt[l], -1);
                         updatedAt[l] = dispatch;
-                      } else {
+                      }
+                      if (k == MetalLevelKernel::Solve) {
                         EXPECT_TRUE(p.useList);
                         EXPECT_EQ(solvedAt[l], -1);
                         solvedAt[l] = dispatch;
@@ -150,7 +151,7 @@ static void checkDispatches(const CoalescedBlockMatrixSkel& skel, int64_t begin,
     if (l >= begin && l < end) {
       EXPECT_GE(solvedAt[l], 0) << "lump " << l;
       if (updatedAt[l] >= 0) {
-        EXPECT_LT(updatedAt[l], solvedAt[l]);
+        EXPECT_LE(updatedAt[l], solvedAt[l]);  // in the same dispatch, the update comes first
       }
     } else {
       EXPECT_EQ(solvedAt[l], -1) << "lump " << l;

@@ -891,6 +891,7 @@ struct LevelSolveParams {
     int64_t ldc;
     int64_t nRHS;
     int64_t transpose;  // solve with L^T
+    int64_t update;     // level_solve_float: update the lumps before solving them
 };
 
 #define LEVEL_SOLVE_ARGS                                                  \
@@ -995,8 +996,9 @@ kernel void level_update_float(LEVEL_SOLVE_ARGS) {
 
 #define kLevelMaxChunk 8  // max right hand sides per pass of the diagonal solve (256 / 32)
 
-// Solve with the diagonal block of each lump (one threadgroup per lump), of any size: L * x = x
-// or L^T * x = x in place. The diagonal block is processed in tiles of up to kDenseTile rows
+// Update (if p.update, see levelUpdate) and solve of each lump of a level, one threadgroup per
+// lump. The solve with the diagonal block, L * x = x or L^T * x = x in place, is for blocks of
+// any size: the diagonal block is processed in tiles of up to kDenseTile rows
 // (staged in threadgroup memory), and the right hand sides in chunks. In a tile each thread
 // owns an element of x (in a register) and the solved values are exchanged in threadgroup memory,
 // one barrier per row. The rest of the lump is then updated with the solved tile (kept in
@@ -1004,12 +1006,18 @@ kernel void level_update_float(LEVEL_SOLVE_ARGS) {
 // threadgroup memory (so that they are read from device memory by consecutive threads), in the
 // solve with L^T the blocks on the left of the tile are read directly (by consecutive threads).
 // Sizes are 32 bit integers (lumps are small), offsets in the vectors are 64 bit.
-kernel void level_diag_solve_float(LEVEL_SOLVE_ARGS) {
+kernel void level_solve_float(LEVEL_SOLVE_ARGS) {
     threadgroup float lt[kDenseTile][kDenseTile + 1];  // diagonal tile, then the blocks below
     threadgroup float xt[kLevelMaxChunk][kDenseTile];  // solved tile of x
     threadgroup float piv[2][kLevelMaxChunk];
 
     const int64_t lump = levelLump(p, levelLumps, tg);
+    if (p.update) {
+        levelUpdate(lumpStart, spanStart, lumpToSpan, spanToLump, chainColPtr, chainRowSpan,
+                    chainData, rowChainPtr, rowChainIdx, rowChainLump, data, x, p, lump, lid, nth);
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+
     const int64_t start = lumpStart[lump];
     const int n = int(lumpStart[lump + 1] - start);
     const int64_t ldc = p.ldc;

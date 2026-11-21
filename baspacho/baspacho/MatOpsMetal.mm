@@ -1139,7 +1139,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
   }
 
   // Solves with L (or L^T) the lumps in [lumpsBegin, lumpsEnd) level by level, see
-  // MetalSolveLevels.h: a couple of dispatches per level, instead of a few per lump
+  // MetalSolveLevels.h: one dispatch per level, instead of a few per lump
   bool levelSolve(const float* data, int64_t lumpsBegin, int64_t lumpsEnd, float* C, int64_t ldc,
                   bool transpose) {
     if (lumpsBegin >= lumpsEnd || nRHS <= 0) {
@@ -1163,14 +1163,14 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
         (__bridge id<MTLBuffer>)sym.devRowChainLump.buffer(),
     };
     id<MTLComputePipelineState> updatePipeline = metalPipeline("level_update_float");
-    id<MTLComputePipelineState> diagPipeline = metalPipeline("level_diag_solve_float");
+    id<MTLComputePipelineState> solvePipeline = metalPipeline("level_solve_float");
     metalLevelSolve(
         sym.skel, transpose ? lv.bwd : lv.fwd, transpose, lumpsBegin, lumpsEnd, ldc, nRHS,
         [&](MetalLevelKernel kernel, const MetalLevelSolveParams& params, int64_t numGroups,
             int64_t numThreads) {
           const MetalLevelSolveParams prm = params;
           stream.dispatchGroups(
-              kernel == MetalLevelKernel::Update ? updatePipeline : diagPipeline,
+              kernel == MetalLevelKernel::Update ? updatePipeline : solvePipeline,
               ^(id<MTLComputeCommandEncoder> encoder) {
                 for (size_t i = 0; i < idx.size(); i++) {
                   [encoder setBuffer:idx[i] offset:0 atIndex:i];

@@ -11,8 +11,9 @@
  *
  * Solving with L lump by lump needs a few GPU dispatches per lump, each one depending on the
  * previous one. Instead, the lumps are grouped in levels (of the elimination tree): the lumps of a
- * level only depend on the lumps of the previous levels, so a level is processed by a few
- * dispatches with one threadgroup per lump, whatever the number of lumps in it.
+ * level only depend on the lumps of the previous levels, so a level is processed by a single
+ * dispatch with one threadgroup per lump (updating and then solving it), whatever the number of
+ * lumps in it.
  *
  * In the solve with L, sibling lumps of a level update the same rows (of their parent), so the
  * updates are "gathered" instead: when lump t is processed it subtracts from its rows the products
@@ -42,8 +43,9 @@ struct MetalLevelSolveParams {
   int64_t ldc;       // vectors are column-major (stride ldc, nRHS columns)
   int64_t nRHS;
   int64_t transpose;  // solve with L^T
+  int64_t update;     // level_solve_float: update the lumps before solving them
 };
-static_assert(sizeof(MetalLevelSolveParams) == 7 * 8, "MetalLevelSolveParams layout");
+static_assert(sizeof(MetalLevelSolveParams) == 8 * 8, "MetalLevelSolveParams layout");
 
 // The blocks below the diagonal, by rows: for span s, the chains with row span s are
 // chain[ptr[s]], ..., chain[ptr[s + 1] - 1], in the columns of lumps lump[...] (sorted)
@@ -154,8 +156,8 @@ struct MetalSolveLevels {
 
 // Kernels of the level solve (see MetalKernels.metal)
 enum class MetalLevelKernel {
-  Update,     // level_update_float: the update of the rows of each lump
-  DiagSolve,  // level_diag_solve_float: the solve with the diagonal block of each lump
+  Update,  // level_update_float: the update of the rows of each lump
+  Solve,   // level_solve_float: the update (if params.update) and solve of each lump
 };
 
 // Threads per threadgroup for lumps up to maxLumpSize: a power of 2 in [32, 256], covering the
@@ -172,7 +174,8 @@ inline int64_t metalLevelThreads(int64_t maxLumpSize, int64_t nRHS) {
 // Runs the solve with L (or L^T if transpose) of the lumps in [lumpsBegin, lumpsEnd), as the
 // per-lump loops in Solver::internalSolveLRange (internalSolveLtRange). The levels must have been
 // computed from lumpsBegin. Calls launch(kernel, params, numThreadgroups, threadsPerThreadgroup)
-// for each dispatch, in order
+// for each dispatch, in order: one dispatch per level (and one for the rows after lumpsEnd in the
+// solve with L)
 template <typename Launch>
 void metalLevelSolve(const CoalescedBlockMatrixSkel& skel, const MetalSolveLevels& levels,
                      bool transpose, int64_t lumpsBegin, int64_t lumpsEnd, int64_t ldc,
@@ -203,16 +206,15 @@ void metalLevelSolve(const CoalescedBlockMatrixSkel& skel, const MetalSolveLevel
     int64_t nth =
         metalLevelThreads(maxLumpSize([&](int64_t i) { return levels.lumps[a + i]; }, b - a), nRHS);
     p.listOff = a;
-    if (lv > 0) {  // lumps in level 0 have no update (nothing before them / below them)
-      launch(MetalLevelKernel::Update, p, b - a, nth);
-    }
-    launch(MetalLevelKernel::DiagSolve, p, b - a, nth);
+    p.update = lv > 0 ? 1 : 0;  // lumps in level 0 have no update (nothing before/below them)
+    launch(MetalLevelKernel::Solve, p, b - a, nth);
   }
 
   // solve with L: the rows after lumpsEnd are updated with the solved lumps (not solved)
   if (!transpose && lumpsBegin < lumpsEnd && lumpsEnd < numLumps) {
     p.useList = 0;
     p.listOff = lumpsEnd;
+    p.update = 1;
     int64_t nth = metalLevelThreads(
         maxLumpSize([&](int64_t i) { return lumpsEnd + i; }, numLumps - lumpsEnd), nRHS);
     launch(MetalLevelKernel::Update, p, numLumps - lumpsEnd, nth);
