@@ -94,12 +94,15 @@ function(bundle_static_library tgt_name bundled_tgt_name)
       add_custom_command(
         COMMAND ${LIBTOOL_TOOL} -static -o ${bundled_tgt_full_name} ${static_libs}
         OUTPUT ${bundled_tgt_full_name}
+        DEPENDS ${static_libs}
         COMMENT "Bundling ${bundled_tgt_name}"
         VERBATIM)
     else()
       add_custom_command(
         COMMAND ${ar_tool} -M < ${CMAKE_CURRENT_BINARY_DIR}/${bundled_tgt_name}.ar
         OUTPUT ${bundled_tgt_full_name}
+        # rebundle when an input archive (or the script listing them) changes
+        DEPENDS ${static_libs} ${CMAKE_CURRENT_BINARY_DIR}/${bundled_tgt_name}.ar
         COMMENT "Bundling ${bundled_tgt_name}"
         VERBATIM)
     endif()
@@ -113,6 +116,7 @@ function(bundle_static_library tgt_name bundled_tgt_name)
     add_custom_command(
       COMMAND ${lib_tool} /NOLOGO /OUT:${bundled_tgt_full_name} ${static_libs_full_names}
       OUTPUT ${bundled_tgt_full_name}
+      DEPENDS ${static_libs_full_names}
       COMMENT "Bundling ${bundled_tgt_name}"
       VERBATIM)
   else()
