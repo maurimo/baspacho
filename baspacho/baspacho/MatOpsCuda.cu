@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <iostream>
+#include <memory>
 #include "baspacho/baspacho/CudaAtomic.cuh"
 #include "baspacho/baspacho/CudaDefs.h"
 #include "baspacho/baspacho/DebugMacros.h"
@@ -53,14 +54,38 @@ struct CudaSymElimCtx : SymElimCtx {
   DevMirror<int64_t> makeBlockPairEnumStraight;
 };
 
+// Owners of the cuBLAS/cuSOLVER handles: as members of CudaSymbolicCtx they are destroyed also
+// if its constructor throws after creating them (eg. a failed upload)
+struct CublasHandleOwner {
+  cublasHandle_t h = nullptr;
+  CublasHandleOwner() { cublasCHECK(cublasCreate(&h)); }
+  ~CublasHandleOwner() {
+    if (h) {
+      cublasWARN(cublasDestroy(h));
+    }
+  }
+  CublasHandleOwner(const CublasHandleOwner&) = delete;
+  CublasHandleOwner& operator=(const CublasHandleOwner&) = delete;
+  operator cublasHandle_t() const { return h; }
+};
+
+struct CusolverDnHandleOwner {
+  cusolverDnHandle_t h = nullptr;
+  CusolverDnHandleOwner() { cusolverCHECK(cusolverDnCreate(&h)); }
+  ~CusolverDnHandleOwner() {
+    if (h) {
+      cusolverWARN(cusolverDnDestroy(h));
+    }
+  }
+  CusolverDnHandleOwner(const CusolverDnHandleOwner&) = delete;
+  CusolverDnHandleOwner& operator=(const CusolverDnHandleOwner&) = delete;
+  operator cusolverDnHandle_t() const { return h; }
+};
+
 struct CudaSymbolicCtx : SymbolicCtx {
   CudaSymbolicCtx(const CoalescedBlockMatrixSkel& skel, const std::vector<int64_t>& permutation)
       : skel(skel) {
-    // TODO: support custom stream in the future
-    cublasCHECK(cublasCreate(&cublasH));
-    // cublasCHECK(cublasSetStream(cublasH, stream));
-    cusolverCHECK(cusolverDnCreate(&cusolverDnH));
-    // cusolverCHECK(cusolverDnSetStream(cusolverDnH, stream));
+    // TODO: support custom stream in the future (cublasSetStream, cusolverDnSetStream)
 
     devLumpToSpan.load(skel.lumpToSpan);
     devChainRowsTillEnd.load(skel.chainRowsTillEnd);
@@ -76,14 +101,7 @@ struct CudaSymbolicCtx : SymbolicCtx {
     devPermutation.load(permutation);
   }
 
-  virtual ~CudaSymbolicCtx() override {
-    if (cublasH) {
-      cublasWARN(cublasDestroy(cublasH));
-    }
-    if (cusolverDnH) {
-      cusolverWARN(cusolverDnDestroy(cusolverDnH));
-    }
-  }
+  virtual ~CudaSymbolicCtx() override {}
 
   virtual PermutedCoalescedAccessor deviceAccessor() override {
     PermutedCoalescedAccessor retv;
@@ -93,7 +111,7 @@ struct CudaSymbolicCtx : SymbolicCtx {
   }
 
   virtual SymElimCtxPtr prepareElimination(int64_t lumpsBegin, int64_t lumpsEnd) override {
-    CudaSymElimCtx* elim = new CudaSymElimCtx;
+    auto elim = std::make_unique<CudaSymElimCtx>();  // owned also if an upload throws
 
     vector<int64_t> makeStraight(lumpsEnd - lumpsBegin + 1);
 
@@ -110,7 +128,7 @@ struct CudaSymbolicCtx : SymbolicCtx {
     elim->numBlockPairs = makeStraight[makeStraight.size() - 1];
     elim->makeBlockPairEnumStraight.load(makeStraight);
 
-    return SymElimCtxPtr(elim);
+    return SymElimCtxPtr(elim.release());
   }
 
   virtual NumericCtxBase* createNumericCtxForType(type_index tIdx, int64_t tempBufSize,
@@ -120,8 +138,8 @@ struct CudaSymbolicCtx : SymbolicCtx {
 
   const CoalescedBlockMatrixSkel& skel;
 
-  cublasHandle_t cublasH = nullptr;
-  cusolverDnHandle_t cusolverDnH = nullptr;
+  CublasHandleOwner cublasH;
+  CusolverDnHandleOwner cusolverDnH;
 
   DevMirror<int64_t> devLumpToSpan;
   DevMirror<int64_t> devChainRowsTillEnd;
@@ -513,7 +531,9 @@ struct CudaNumericCtx : NumericCtx<T> {
 template <>
 void CudaNumericCtx<double>::potrf(int64_t n, double* data, int64_t offA) {
   auto timer = sym.potrfStat.instance<CudaSyncOps>(sizeof(double), n);
-  sym.potrfBiggestN = max(sym.potrfBiggestN, n);
+  if (sym.potrfStat.enabled) {  // stats are opt-in
+    sym.potrfBiggestN = max(sym.potrfBiggestN, n);
+  }
 
   int workspaceSize;
   cusolverCHECK(cusolverDnDpotrf_bufferSize(sym.cusolverDnH, CUBLAS_FILL_MODE_UPPER, n, data + offA,
@@ -524,17 +544,15 @@ void CudaNumericCtx<double>::potrf(int64_t n, double* data, int64_t offA) {
 
   cusolverCHECK(cusolverDnDpotrf(sym.cusolverDnH, CUBLAS_FILL_MODE_UPPER, n, data + offA, n,
                                  devTempBuffer.ptr, workspaceSize, devPotrfSingIndex.ptr));
-
-  // TODO: handle/report singularity
-  // int info;
-  // cuCHECK(cudaMemcpy(&info, devPotrfSingIndex.ptr, 1 * sizeof(int), cudaMemcpyDeviceToHost));
-  // std::cout << info << std::endl;
+  // not positive definite: cuSOLVER leaves NaN in the block (CudaFactor.NotPositiveDefinite)
 }
 
 template <>
 void CudaNumericCtx<float>::potrf(int64_t n, float* data, int64_t offA) {
   auto timer = sym.potrfStat.instance<CudaSyncOps>(sizeof(float), n);
-  sym.potrfBiggestN = max(sym.potrfBiggestN, n);
+  if (sym.potrfStat.enabled) {  // stats are opt-in
+    sym.potrfBiggestN = max(sym.potrfBiggestN, n);
+  }
 
   int workspaceSize;
   cusolverCHECK(cusolverDnSpotrf_bufferSize(sym.cusolverDnH, CUBLAS_FILL_MODE_UPPER, n, data + offA,
@@ -545,11 +563,7 @@ void CudaNumericCtx<float>::potrf(int64_t n, float* data, int64_t offA) {
 
   cusolverCHECK(cusolverDnSpotrf(sym.cusolverDnH, CUBLAS_FILL_MODE_UPPER, n, data + offA, n,
                                  devTempBuffer.ptr, workspaceSize, devPotrfSingIndex.ptr));
-
-  // TODO: handle/report singularity
-  // int info;
-  // cuCHECK(cudaMemcpy(&info, devPotrfSingIndex.ptr, 1 * sizeof(int), cudaMemcpyDeviceToHost));
-  // std::cout << info << std::endl;
+  // not positive definite: cuSOLVER leaves NaN in the block (CudaFactor.NotPositiveDefinite)
 }
 
 template <>
@@ -579,7 +593,9 @@ void CudaNumericCtx<double>::saveSyrkGemm(int64_t m, int64_t n, int64_t k, const
   cublasCHECK(cublasDgemm(sym.cublasH, CUBLAS_OP_C, CUBLAS_OP_N, m, n, k, &alpha, data + offset, k,
                           data + offset, k, &beta, devTempBuffer.ptr, m));
 
-  sym.gemmCalls++;
+  if (sym.sygeStat.enabled) {  // stats are opt-in
+    sym.gemmCalls++;
+  }
 }
 
 template <>
@@ -591,7 +607,9 @@ void CudaNumericCtx<float>::saveSyrkGemm(int64_t m, int64_t n, int64_t k, const 
   cublasCHECK(cublasSgemm(sym.cublasH, CUBLAS_OP_C, CUBLAS_OP_N, m, n, k, &alpha, data + offset, k,
                           data + offset, k, &beta, devTempBuffer.ptr, m));
 
-  sym.gemmCalls++;
+  if (sym.sygeStat.enabled) {  // stats are opt-in
+    sym.gemmCalls++;
+  }
 }
 
 template <typename T>
@@ -741,11 +759,6 @@ void CudaNumericCtx<vector<double*>>::potrf(int64_t n, vector<double*>* data, in
 
   cusolverCHECK(cusolverDnDpotrfBatched(sym.cusolverDnH, CUBLAS_FILL_MODE_UPPER, n, devPtrsA.ptr, n,
                                         devPotrfSingIndex.ptr, data->size()));
-
-  // TODO: handle/report singularity
-  // vector<int> info(data->size());
-  // devPotrfSingIndex.get(info);
-  // cout << "info: " << printVec(info) << endl;
 }
 
 template <>
@@ -756,11 +769,6 @@ void CudaNumericCtx<vector<float*>>::potrf(int64_t n, vector<float*>* data, int6
 
   cusolverCHECK(cusolverDnSpotrfBatched(sym.cusolverDnH, CUBLAS_FILL_MODE_UPPER, n, devPtrsA.ptr, n,
                                         devPotrfSingIndex.ptr, data->size()));
-
-  // TODO: handle/report singularity
-  // vector<int> info(data->size());
-  // devPotrfSingIndex.get(info);
-  // cout << "info: " << printVec(info) << endl;
 }
 
 template <>
@@ -799,7 +807,9 @@ void CudaNumericCtx<vector<double*>>::saveSyrkGemm(int64_t m, int64_t n, int64_t
   cublasCHECK(cublasDgemmBatched(sym.cublasH, CUBLAS_OP_C, CUBLAS_OP_N, m, n, k, &alpha,
                                  devPtrsA.ptr, k, devPtrsA.ptr, k, &beta, devTempBufsDev.ptr, m,
                                  data->size()));
-  sym.gemmCalls++;
+  if (sym.sygeStat.enabled) {  // stats are opt-in
+    sym.gemmCalls++;
+  }
 }
 
 template <>
@@ -812,7 +822,9 @@ void CudaNumericCtx<vector<float*>>::saveSyrkGemm(int64_t m, int64_t n, int64_t 
   cublasCHECK(cublasSgemmBatched(sym.cublasH, CUBLAS_OP_C, CUBLAS_OP_N, m, n, k, &alpha,
                                  devPtrsA.ptr, k, devPtrsA.ptr, k, &beta, devTempBufsDev.ptr, m,
                                  data->size()));
-  sym.gemmCalls++;
+  if (sym.sygeStat.enabled) {  // stats are opt-in
+    sym.gemmCalls++;
+  }
 }
 
 // SolveCtx helpers
