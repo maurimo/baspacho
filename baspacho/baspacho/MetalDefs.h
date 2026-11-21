@@ -61,21 +61,23 @@ constexpr int64_t kMetalMpsGemmMinOps = 64 * 64 * 64;
 // Number of dense products run with MetalPerformanceShaders so far (diagnostics, tests)
 int64_t metalMpsGemmCount();
 
-// Error checking macro for Metal operations
-#define mtlCHECK(condition, msg)                                               \
-  do {                                                                         \
-    if (!(condition)) {                                                        \
-      fprintf(stderr, "[%s:%d] Metal Error: %s\n", __FILE__, __LINE__, (msg)); \
-      abort();                                                                 \
-    }                                                                          \
+// Error checking for Metal operations: throws std::runtime_error (the process can recover, eg.
+// falling back to another backend)
+#define mtlCHECK(condition, msg)                                                               \
+  do {                                                                                         \
+    if (!(condition)) {                                                                        \
+      throw std::runtime_error(std::string("Metal error (") + __FILE__ + ":" +                 \
+                               std::to_string(__LINE__) + "): " + (msg));                      \
+    }                                                                                          \
   } while (0)
 
-#define CHECK_METAL_ALLOCATION(ptr, size)                                  \
-  if (ptr == nullptr) {                                                    \
-    fprintf(stderr, "Metal: allocation of block of %ld bytes failed\n",    \
-            static_cast<long>(size));                                      \
-    abort();                                                               \
-  }
+#define CHECK_METAL_ALLOCATION(ptr, size)                                                      \
+  do {                                                                                         \
+    if ((ptr) == nullptr) {                                                                    \
+      throw std::runtime_error("Metal: allocation of " + std::to_string((long long)(size)) +   \
+                               " bytes failed");                                               \
+    }                                                                                          \
+  } while (0)
 
 // Forward declarations for Metal context (implemented in MetalDefs.mm)
 // These allow C++ code to use Metal without including Objective-C headers
@@ -154,6 +156,8 @@ class MetalMirror {
   void clear();
   void resizeToAtLeast(size_t size);
   void load(const std::vector<T>& vec);
+  // copies the first vec.size() elements of the buffer to vec (throws std::out_of_range if
+  // vec is larger than the buffer)
   void get(std::vector<T>& vec) const;
 
   // Get raw pointer for kernel access

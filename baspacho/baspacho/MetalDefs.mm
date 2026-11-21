@@ -15,7 +15,19 @@
 #include <mutex>
 #include <unordered_map>
 
+// The compiled shader library (MetalKernels.metallib), embedded in the binary at build time
+// (generated MetalKernelsLib.cpp), so that it doesn't depend on the build directory
+extern "C" const unsigned char baspacho_metallib_data[];
+extern "C" const size_t baspacho_metallib_size;
+
 namespace BaSpaCho {
+
+bool metalDeviceAvailable() {
+  @autoreleasepool {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    return device != nil;
+  }
+}
 
 // Implementation class for MetalContext - holds Objective-C objects
 class MetalContextImpl {
@@ -38,21 +50,16 @@ class MetalContextImpl {
       commandQueue = [device newCommandQueue];
       mtlCHECK(commandQueue != nil, "Failed to create Metal command queue");
 
-      // Load the compiled shader library
-#ifdef BASPACHO_METAL_LIBRARY_PATH
+      // Load the shader library embedded in the binary
       NSError* error = nil;
-      NSString* libraryPath = @BASPACHO_METAL_LIBRARY_PATH;
-      NSURL* libraryURL = [NSURL fileURLWithPath:libraryPath];
-      library = [device newLibraryWithURL:libraryURL error:&error];
-      if (error != nil) {
-        NSLog(@"Failed to load Metal library from %@: %@", libraryPath, error);
-        // Try loading default library as fallback
-        library = [device newDefaultLibrary];
+      dispatch_data_t libData =
+          dispatch_data_create(baspacho_metallib_data, baspacho_metallib_size, nil,
+                               DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+      library = [device newLibraryWithData:libData error:&error];
+      if (library == nil) {
+        std::string what = error ? error.localizedDescription.UTF8String : "unknown error";
+        mtlCHECK(false, "Failed to load the embedded Metal shader library: " + what);
       }
-#else
-      library = [device newDefaultLibrary];
-#endif
-      mtlCHECK(library != nil, "Failed to load Metal shader library");
 
       NSLog(@"Metal initialized: %@", device.name);
     }
@@ -110,13 +117,13 @@ void* MetalContext::commandQueue() { return (__bridge void*)impl->commandQueue; 
 void* MetalContext::library() { return (__bridge void*)impl->library; }
 
 void MetalContext::synchronize() {
-  std::vector<std::pair<void*, std::function<void()>>> toFlush;
   {
+    // The lock is held while flushing: a context (on another thread) can't unregister and
+    // destroy its stream during the flush. Each stream serializes its own encoding and flushing
     std::lock_guard<std::mutex> lock(impl->flushersMutex);
-    toFlush = impl->flushers;
-  }
-  for (auto& f : toFlush) {
-    f.second();
+    for (auto& f : impl->flushers) {
+      f.second();
+    }
   }
   @autoreleasepool {
     id<MTLCommandBuffer> cmdBuf = [impl->commandQueue commandBuffer];
@@ -166,6 +173,10 @@ void MetalMirror<T>::resizeToAtLeast(size_t size) {
   if (!buffer_ && size > 0) {
     @autoreleasepool {
       id<MTLDevice> device = (__bridge id<MTLDevice>)MetalContext::instance().device();
+      if (size > device.maxBufferLength / sizeof(T)) {
+        throw std::runtime_error("Metal: buffer of " + std::to_string(size) + " elements of " +
+                                 std::to_string(sizeof(T)) + " bytes exceeds the device limit");
+      }
       // Use shared storage mode for CPU/GPU access
       id<MTLBuffer> buf = [device newBufferWithLength:size * sizeof(T)
                                               options:MTLResourceStorageModeShared];
@@ -193,6 +204,10 @@ void MetalMirror<T>::load(const std::vector<T>& vec) {
 
 template <typename T>
 void MetalMirror<T>::get(std::vector<T>& vec) const {
+  if (vec.size() > allocSize_) {
+    throw std::out_of_range("MetalMirror::get: destination of " + std::to_string(vec.size()) +
+                            " elements, buffer of " + std::to_string(allocSize_));
+  }
   if (!ptr_ || vec.empty()) {
     return;
   }

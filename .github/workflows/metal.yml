@@ -64,12 +64,30 @@ jobs:
         with:
           label: ctest CPU ${{ matrix.os }}
           args: -E "Metal" -j"$(sysctl -n hw.ncpu)"
+      - name: Check that the Metal device tests are registered
+        run: |
+          # a build without Metal must not pass the Metal step with host-only tests
+          n=$(ctest --test-dir build -N -R '^MetalSolver\.Grid3d_MpsGemm$' | sed -n 's/^Total Tests: //p')
+          if [ "$n" != "1" ]; then
+            echo "::error title=Metal tests ${{ matrix.os }}::MetalSolver.Grid3d_MpsGemm is not registered"
+            exit 1
+          fi
       - name: Test (Metal)
         if: always()
         uses: ./.github/actions/ctest
         with:
           label: ctest Metal ${{ matrix.os }}
           args: -R "Metal"
+      - name: Test relocated binary (shader library embedded)
+        if: always()
+        run: |
+          # run a solve from a copy of a test binary while the build tree is not available
+          cp build/baspacho/tests/MetalRobustnessTest "$RUNNER_TEMP/"
+          mv build build-hidden
+          status=0
+          (cd "$RUNNER_TEMP" && ./MetalRobustnessTest --gtest_filter='*ReadmeExample*') || status=$?
+          mv build-hidden build
+          exit $status
       - name: Report Metal accuracy
         if: always()
         run: |

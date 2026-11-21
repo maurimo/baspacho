@@ -12,6 +12,8 @@
 #include <atomic>
 #include <chrono>
 #include <iostream>
+#include <mutex>
+#include <string>
 #include <typeindex>
 
 #include "baspacho/baspacho/CoalescedBlockMatrix.h"
@@ -154,8 +156,11 @@ int64_t metalMpsGemmCount() { return mpsGemmCount.load(); }
 // Records the GPU work of a numeric/solve context: dispatches are encoded in order in a serial
 // compute encoder (so each one sees the results of the previous ones), and command buffers are
 // committed in batches without waiting. The CPU waits only in flush(), called when the results
-// are needed on the host: by MetalMirror::get/load (via MetalContext::synchronize), and when
-// the context is destroyed (ie at the end of Solver::factor, solve, etc).
+// are needed on the host: by MetalMirror::get/load (via MetalContext::synchronize, possibly from
+// another thread), by finish() at the end of each Solver operation, and when the context is
+// destroyed. All the methods lock the stream, so a flush from another thread never interleaves
+// with the encoding. A failed command buffer is remembered: finish() reports it to the owner even
+// if the flush that found it was run by another thread.
 class MetalStream {
  public:
   static constexpr int kMaxDispatchesPerCommandBuffer = 256;
@@ -165,11 +170,13 @@ class MetalStream {
   }
 
   ~MetalStream() {
+    // after this no other thread can flush the stream (synchronize holds the same lock while
+    // flushing), so it can be destroyed
     MetalContext::instance().removePendingWorkFlusher(this);
     try {
       flush();
     } catch (const std::exception& e) {
-      fprintf(stderr, "Metal: %s\n", e.what());
+      fprintf(stderr, "Metal: %s\n", e.what());  // destructors can't throw, see finish()
     }
   }
 
@@ -200,6 +207,7 @@ class MetalStream {
                                " threads exceeds the pipeline limit of " +
                                std::to_string(pipeline.maxTotalThreadsPerThreadgroup));
     }
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     @autoreleasepool {
       if (!encoder) {
         encoder = [commandBuffer() computeCommandEncoder];
@@ -208,24 +216,23 @@ class MetalStream {
       encodeBlock(encoder);
       [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:groupSize];
     }
-    countDispatch();
+    countDispatchLocked();
   }
 
-  // Command buffer to encode MetalPerformanceShaders kernels into, after the work recorded so
-  // far. Call countDispatch() after encoding
-  id<MTLCommandBuffer> commandBufferForMps() {
+  // Encodes MetalPerformanceShaders kernels with encodeBlock(commandBuffer), after the work
+  // recorded so far (with the stream locked: the command buffer can't be committed meanwhile)
+  void encodeMps(void (^encodeBlock)(id<MTLCommandBuffer>)) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     endEncoding();
-    return commandBuffer();
-  }
-
-  void countDispatch() {
-    if (++numDispatches >= kMaxDispatchesPerCommandBuffer) {
-      commit();
+    @autoreleasepool {
+      encodeBlock(commandBuffer());
     }
+    countDispatchLocked();
   }
 
   // Commits the recorded work (without waiting)
   void commit() {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     endEncoding();
     if (cmdBuf) {
       [cmdBuf commit];
@@ -237,6 +244,7 @@ class MetalStream {
 
   // Commits the recorded work and waits for its completion, throws on errors
   void flush() {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     @autoreleasepool {
       commit();
       std::vector<id<MTLCommandBuffer>> toWait;
@@ -245,12 +253,36 @@ class MetalStream {
         [buf waitUntilCompleted];
       }
       for (id<MTLCommandBuffer> buf : toWait) {
-        checkCommandBuffer(buf, "MetalStream");
+        try {
+          checkCommandBuffer(buf, "MetalStream");
+        } catch (const std::exception& e) {
+          if (error.empty()) {
+            error = e.what();
+          }
+          throw;
+        }
       }
     }
   }
 
+  // Completes the work and throws if any of it failed (also if found by another thread's flush)
+  void finish() {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    flush();
+    if (!error.empty()) {
+      std::string what = error;
+      error.clear();
+      throw std::runtime_error(what);
+    }
+  }
+
  private:
+  void countDispatchLocked() {
+    if (++numDispatches >= kMaxDispatchesPerCommandBuffer) {
+      commit();
+    }
+  }
+
   id<MTLCommandBuffer> commandBuffer() {
     if (!cmdBuf) {
       cmdBuf = [queue commandBuffer];
@@ -265,11 +297,13 @@ class MetalStream {
     }
   }
 
+  std::recursive_mutex mutex;
   id<MTLCommandQueue> queue;
   id<MTLCommandBuffer> cmdBuf = nil;
   id<MTLComputeCommandEncoder> encoder = nil;
   std::vector<id<MTLCommandBuffer>> committed;
   int numDispatches = 0;
+  std::string error;  // first command buffer error, reported by finish()
 };
 
 static id<MTLComputePipelineState> metalPipeline(const char* name) {
@@ -595,16 +629,12 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     potrfStatus.load(std::vector<int32_t>{0});
   }
 
-  virtual ~MetalNumericCtx() override {
-    try {
-      stream.flush();
-    } catch (const std::exception& e) {
-      fprintf(stderr, "Metal: %s\n", e.what());
-    }
-    if (potrfStatus.ptr()[0] != 0) {
-      fprintf(stderr, "Metal potrf: Cholesky failed (matrix not positive definite)\n");
-    }
-  }
+  // the stream is flushed by its destructor (errors are only logged there, see finish()). A block
+  // that is not positive definite gives NaN in the factor (as on the other backends), potrfStatus
+  // is only informative
+  virtual ~MetalNumericCtx() override {}
+
+  virtual void finish() override { stream.finish(); }
 
   virtual void pseudoFactorSpans(float* data, int64_t spanBegin, int64_t spanEnd) override {
     @autoreleasepool {
@@ -815,11 +845,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
                                                       alpha:1.0
                                                        beta:0.0];
 
-        [gemm encodeToCommandBuffer:stream.commandBufferForMps()
-                         leftMatrix:mpsB
-                        rightMatrix:mpsA
-                       resultMatrix:mpsC];
-        stream.countDispatch();
+        stream.encodeMps(^(id<MTLCommandBuffer> cmdBuf) {
+          [gemm encodeToCommandBuffer:cmdBuf leftMatrix:mpsB rightMatrix:mpsA resultMatrix:mpsC];
+        });
         mpsGemmCount++;
       } else {
         MetalDense::syrkGemm(stream, d, m, n, k, offset, temp);
@@ -923,6 +951,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
   }
 
   virtual ~MetalSolveCtx() override {}
+
+  virtual void finish() override { stream.finish(); }
 
   virtual void sparseElimSolveL(const SymElimCtx& elimData, const float* data, int64_t lumpsBegin,
                                 int64_t lumpsEnd, float* C, int64_t ldc) override {

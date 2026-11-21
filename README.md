@@ -103,22 +103,44 @@ Apple Silicon GPUs lack native double-precision FP64 support. Attempting to use
 double precision with the Metal backend will result in a runtime error. For double
 precision, use the CPU backend (`BackendFast`) or CUDA (`BackendCuda`).
 
-The Metal backend uses:
-- Custom Metal compute shaders for sparse operations (factor_lumps, sparse_elim, assemble)
-- Metal Performance Shaders (MPS) for dense matrix multiply on large matrices
-- Eigen/Accelerate for Cholesky factorization (potrf) and triangular solve (trsm)
+All the numeric work runs on the GPU: custom Metal compute kernels (sparse elimination,
+assembly, dense Cholesky, triangular solves) and Metal Performance Shaders for the large dense
+products. The shader library is embedded in the BaSpaCho library. Data is passed in Metal
+buffers, eg. with `MetalMirror`:
+```cpp
+#include "baspacho/baspacho/MetalDefs.h"
+#include "baspacho/baspacho/Solver.h"
+
+Settings settings;
+settings.backend = BackendMetal;
+SolverPtr solver = createSolver(settings, paramSize, structure);
+
+std::vector<float> data(solver->dataSize());  // fill with the matrix (see solver->accessor())
+MetalMirror<float> dataGpu(data);
+solver->factor(dataGpu.ptr());
+std::vector<float> rhs(solver->order());  // fill with the right hand side
+MetalMirror<float> rhsGpu(rhs);
+solver->solve(dataGpu.ptr(), rhsGpu.ptr(), solver->order(), /* nRHS = */ 1);
+rhsGpu.get(rhs);  // waits for the GPU and copies the solution back
+```
+GPU errors are reported by throwing `std::runtime_error` from the solver call.
 
 ### Backend Selection
-BaSpaCho supports automatic backend selection with `BackendAuto`:
+The backend is chosen explicitly with `Settings::backend` (recommended): it determines the
+scalar types that can be used (Metal: float only) and where the data must live (host memory for
+`BackendFast`/`BackendRef`, CUDA device memory for `BackendCuda`, Metal buffers for
+`BackendMetal`).
+
+`BackendAuto` picks the first backend, in the order CUDA > Metal > CPU (BLAS), that is compiled
+in and has a device available at runtime. Since the data must be allocated accordingly, query
+it first with `detectBestBackend()`:
 ```cpp
+BackendType backend = detectBestBackend();  // BackendCuda, BackendMetal or BackendFast
 Settings settings;
-settings.backend = BackendAuto;  // Auto-detect best backend
-auto solver = createSolver<float>(paramSize, structure, settings);
+settings.backend = backend;
+SolverPtr solver = createSolver(settings, paramSize, structure);
+// allocate the data for `backend` (eg. MetalMirror<float> for BackendMetal)
 ```
-
-The detection priority is: CUDA > Metal > CPU (BLAS).
-
-You can also use `detectBestBackend()` to query the recommended backend at runtime.
 
 ### BLAS
 The library used is specified in the CMake variable BLA_VENDOR,

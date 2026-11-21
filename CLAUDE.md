@@ -118,11 +118,11 @@ The Metal backend provides GPU acceleration on Apple Silicon Macs (M1, M2, M3, e
 // Metal backend usage (float only)
 Settings settings;
 settings.backend = BackendMetal;
-auto solver = createSolver<float>(paramSize, structure, settings);
+SolverPtr solver = createSolver(settings, paramSize, structure);
 
 // Use MetalMirror for GPU memory management
 MetalMirror<float> dataGpu(hostData);
-solver.factor(dataGpu.ptr());
+solver->factor(dataGpu.ptr());
 dataGpu.get(hostData);  // Copy back to CPU
 ```
 

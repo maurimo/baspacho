@@ -190,7 +190,7 @@ enum BackendType {
   BackendRef,    // reference implementation, not recommended
   BackendFast,   // CPU with BLAS (recommended for CPU)
   BackendCuda,   // NVIDIA GPU with cuBLAS (float and double)
-  BackendMetal,  // Apple Metal GPU backend (macOS/iOS, float only)
+  BackendMetal,  // Apple Metal GPU backend (macOS, float only)
   BackendAuto,   // Automatically select best available backend
 };
 
@@ -199,7 +199,7 @@ enum BackendType {
  *
  * Priority order:
  * 1. CUDA (if compiled with BASPACHO_USE_CUBLAS and GPU available)
- * 2. Metal (if compiled with BASPACHO_USE_METAL on macOS with Apple Silicon)
+ * 2. Metal (if compiled with BASPACHO_USE_METAL and a Metal device is available)
  * 3. Fast (CPU with BLAS, always available)
  *
  * @return BackendType The detected best backend (never returns BackendAuto or BackendRef)

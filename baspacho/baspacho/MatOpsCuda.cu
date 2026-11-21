@@ -1470,4 +1470,13 @@ SolveCtxBase* CudaSymbolicCtx::createSolveCtxForType(type_index tIdx, int nRHS, 
 
 OpsPtr cudaOps() { return OpsPtr(new CudaOps); }
 
+bool cudaDeviceAvailable() {
+  int count = 0;
+  if (cudaGetDeviceCount(&count) != cudaSuccess) {
+    cudaGetLastError();  // clear the error (eg. no driver)
+    return false;
+  }
+  return count > 0;
+}
+
 }  // end namespace BaSpaCho

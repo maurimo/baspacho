@@ -95,8 +95,17 @@ if(BASPACHO_USE_METAL)
         COMMENT "Linking Metal shader library"
     )
 
-    add_custom_target(metal_shaders ALL DEPENDS "${METAL_SHADER_LIB}")
-    add_dependencies(${BASPACHO_LIBRARY} metal_shaders)
+    # the metallib is embedded in the library (loaded with newLibraryWithData), so that binaries
+    # don't depend on the build directory
+    set(METAL_SHADER_LIB_CPP "${CMAKE_CURRENT_BINARY_DIR}/MetalKernelsLib.cpp")
+    add_custom_command(
+        OUTPUT "${METAL_SHADER_LIB_CPP}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${METAL_SHADER_LIB} -DOUTPUT=${METAL_SHADER_LIB_CPP}
+                -DSYMBOL=baspacho_metallib -P ${PROJECT_SOURCE_DIR}/cmake/EmbedFile.cmake
+        DEPENDS "${METAL_SHADER_LIB}" ${PROJECT_SOURCE_DIR}/cmake/EmbedFile.cmake
+        COMMENT "Embedding Metal shader library"
+    )
+    target_sources(${BASPACHO_LIBRARY} PRIVATE "${METAL_SHADER_LIB_CPP}")
 
     # Link Metal frameworks
     target_link_libraries(${BASPACHO_LIBRARY}
@@ -109,9 +118,6 @@ if(BASPACHO_USE_METAL)
     set_source_files_properties(${BASPACHO_METAL_SOURCES}
         PROPERTIES COMPILE_FLAGS "-x objective-c++ -std=c++17 -fobjc-arc")
 
-    # Define path to compiled metallib for runtime loading
-    target_compile_definitions(${BASPACHO_LIBRARY} PRIVATE
-        BASPACHO_METAL_LIBRARY_PATH="${METAL_SHADER_LIB}")
 endif()
 
 target_compile_options(${BASPACHO_LIBRARY} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${BASPACHO_CXX_FLAGS}>)

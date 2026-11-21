@@ -55,10 +55,18 @@ struct Ops {
 
 struct NumericCtxBase {
   virtual ~NumericCtxBase() {}
+
+  // Called by the Solver at the end of each operation: completes the work issued by the context
+  // (eg. waits for the GPU) and reports its errors by throwing. The destructor must not throw,
+  // so errors detected there could only be logged
+  virtual void finish() {}
 };
 
 struct SolveCtxBase {
   virtual ~SolveCtxBase() {}
+
+  // as NumericCtxBase::finish
+  virtual void finish() {}
 };
 
 // (symbolic) context for factorization, constant indices (and GPU copies)
@@ -218,10 +226,16 @@ OpsPtr fastOps(int numThreads = 16);
 
 #ifdef BASPACHO_USE_CUBLAS
 OpsPtr cudaOps();
+
+// true if a CUDA device is available at runtime
+bool cudaDeviceAvailable();
 #endif
 
 #ifdef BASPACHO_USE_METAL
 OpsPtr metalOps();
+
+// true if a Metal device is available at runtime
+bool metalDeviceAvailable();
 #endif
 
 }  // end namespace BaSpaCho

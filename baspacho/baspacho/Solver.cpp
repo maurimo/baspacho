@@ -178,6 +178,7 @@ void Solver::internalFactorRange(T* data, int64_t startSpanIndex, int64_t endSpa
   for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
     if (sparseElimRanges[l + 1] > upToLump) {
       BASPACHO_CHECK_EQ(sparseElimRanges[l], upToLump);
+      numCtx->finish();
       return;
     } else if (startLump > sparseElimRanges[l]) {
       BASPACHO_CHECK_GE(startLump, sparseElimRanges[l + 1]);
@@ -216,6 +217,8 @@ void Solver::internalFactorRange(T* data, int64_t startSpanIndex, int64_t endSpa
       factorLump(*numCtx, data, l);
     }
   }
+
+  numCtx->finish();
 }
 
 template <typename T>
@@ -223,6 +226,7 @@ void Solver::solve(const T* matData, T* vecData, int64_t stride, int nRHS) const
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
   internalSolveLRange(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
   internalSolveLtRange(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
+  slvCtx->finish();
 }
 
 template <typename T>
@@ -240,6 +244,7 @@ void Solver::solveLUpTo(const T* matData, int64_t spanIndex, T* vecData, int64_t
                         int nRHS) const {
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
   internalSolveLRange(*slvCtx, matData, 0, spanIndex, vecData, stride, nRHS);
+  slvCtx->finish();
 }
 
 template <typename T>
@@ -247,6 +252,7 @@ void Solver::solveLtUpTo(const T* matData, int64_t spanIndex, T* vecData, int64_
                          int nRHS) const {
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
   internalSolveLtRange(*slvCtx, matData, 0, spanIndex, vecData, stride, nRHS);
+  slvCtx->finish();
 }
 
 template <typename T>
@@ -254,6 +260,7 @@ void Solver::solveLFrom(const T* matData, int64_t spanIndex, T* vecData, int64_t
                         int nRHS) const {
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
   internalSolveLRange(*slvCtx, matData, spanIndex, factorSkel.numSpans(), vecData, stride, nRHS);
+  slvCtx->finish();
 }
 
 template <typename T>
@@ -261,6 +268,7 @@ void Solver::solveLtFrom(const T* matData, int64_t spanIndex, T* vecData, int64_
                          int nRHS) const {
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
   internalSolveLtRange(*slvCtx, matData, spanIndex, factorSkel.numSpans(), vecData, stride, nRHS);
+  slvCtx->finish();
 }
 
 static constexpr bool SparseElimSolve = true;
@@ -413,6 +421,7 @@ void Solver::addMvFrom(const T* matData, int64_t spanIndex, const T* inVecData, 
   if (numSpans == upToLump - denseOpsFromLump && slvCtx->hasFragmentedOps() && nRHS == 1) {
     BASPACHO_CHECK_EQ(factorSkel.lumpToSpan[denseOpsFromLump], denseOpsFromLump);
     slvCtx->fragmentedMV(matData, inVecData, denseOpsFromLump, upToLump, outVecData, alpha);
+    slvCtx->finish();
     return;
   }
 
@@ -446,12 +455,15 @@ void Solver::addMvFrom(const T* matData, int64_t spanIndex, const T* inVecData, 
     slvCtx->gemvT(matData, belowDiagOffset, numRowsBelowDiag, lumpSize, outVecData, lumpStart,
                   outStride, alpha);
   }
+
+  slvCtx->finish();
 }
 
 template <typename T>
 void Solver::pseudoFactorFrom(T* data, int64_t spanIndex, bool /* verbose */) const {
   NumericCtxPtr<T> numCtx = symCtx->createNumericCtx<T>(maxElimTempSize, data);
   numCtx->pseudoFactorSpans(data, spanIndex, factorSkel.numSpans());
+  numCtx->finish();
 }
 
 template void Solver::factor<double>(double* data, bool verbose) const;
@@ -594,16 +606,19 @@ void Solver::resetStats() {
 }
 
 BackendType detectBestBackend() {
-  // Priority: CUDA > Metal > Fast (CPU)
+  // Priority: CUDA > Metal > Fast (CPU), among the backends compiled in and with a device
+  // available at runtime
 #ifdef BASPACHO_USE_CUBLAS
-  // TODO: Could add runtime CUDA device detection here
-  return BackendCuda;
-#elif defined(BASPACHO_USE_METAL)
-  // Metal is available on macOS with Apple Silicon
-  return BackendMetal;
-#else
-  return BackendFast;
+  if (cudaDeviceAvailable()) {
+    return BackendCuda;
+  }
 #endif
+#ifdef BASPACHO_USE_METAL
+  if (metalDeviceAvailable()) {
+    return BackendMetal;
+  }
+#endif
+  return BackendFast;
 }
 
 OpsPtr getBackend(const Settings& settings) {
