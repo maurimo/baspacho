@@ -61,6 +61,14 @@ constexpr int64_t kMetalMpsGemmMinOps = 64 * 64 * 64;
 // Number of dense products run with MetalPerformanceShaders so far (diagnostics, tests)
 int64_t metalMpsGemmCount();
 
+// Statistics of the GPU work of the numeric/solve contexts so far (diagnostics, tests)
+struct MetalStats {
+  int64_t dispatches;      // kernels encoded (including MetalPerformanceShaders kernels)
+  int64_t commandBuffers;  // command buffers completed
+  double gpuSeconds;       // sum of the GPU execution times of the completed command buffers
+};
+MetalStats metalStats();
+
 // Error checking macro for Metal operations
 #define mtlCHECK(condition, msg)                                               \
   do {                                                                         \

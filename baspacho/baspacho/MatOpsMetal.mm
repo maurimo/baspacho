@@ -195,6 +195,14 @@ static void checkCommandBuffer(id<MTLCommandBuffer> cmdBuf, const char* what) {
 static std::atomic<int64_t> mpsGemmCount{0};
 int64_t metalMpsGemmCount() { return mpsGemmCount.load(); }
 
+static std::atomic<int64_t> statDispatches{0};
+static std::atomic<int64_t> statCommandBuffers{0};
+static std::atomic<int64_t> statGpuNanoseconds{0};
+MetalStats metalStats() {
+  return MetalStats{statDispatches.load(), statCommandBuffers.load(),
+                    statGpuNanoseconds.load() * 1e-9};
+}
+
 // Records the GPU work of a numeric/solve context: dispatches are encoded in order in a serial
 // compute encoder (so each one sees the results of the previous ones), and command buffers are
 // committed in batches without waiting. The CPU waits only in flush(), called when the results
@@ -263,6 +271,7 @@ class MetalStream {
   }
 
   void countDispatch() {
+    statDispatches++;
     if (++numDispatches >= kMaxDispatchesPerCommandBuffer) {
       commit();
     }
@@ -287,6 +296,10 @@ class MetalStream {
       toWait.swap(committed);
       for (id<MTLCommandBuffer> buf : toWait) {
         [buf waitUntilCompleted];
+      }
+      for (id<MTLCommandBuffer> buf : toWait) {
+        statCommandBuffers++;
+        statGpuNanoseconds += (int64_t)((buf.GPUEndTime - buf.GPUStartTime) * 1e9);
       }
       for (id<MTLCommandBuffer> buf : toWait) {
         checkCommandBuffer(buf, "MetalStream");

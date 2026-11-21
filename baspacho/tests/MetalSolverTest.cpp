@@ -184,6 +184,9 @@ struct Errors {
   double residual;  // |A x - b| / |b|
   double factorMs;  // time of factor (second run, after warm-up), informative only
   double solveMs;   // time of solve (second run)
+  // Metal only (second run): GPU execution time, kernels dispatched, command buffers
+  double factorGpuMs = 0, solveGpuMs = 0;
+  int64_t factorDispatches = 0, solveDispatches = 0, factorCmdBufs = 0, solveCmdBufs = 0;
 };
 
 double msSince(chrono::steady_clock::time_point t0) {
@@ -219,18 +222,28 @@ Errors factorSolveErrors(BackendType backend, const Problem& prob, int nRHS, int
   const vector<float> data0 = data;
   vector<float> x;
   double factorMs = 0, solveMs = 0;
+  Errors e;
   for (int run = 0; run < 2; run++) {
     data = data0;
     x = rhs;
     if (backend == BackendMetal) {
 #ifdef BASPACHO_USE_METAL
       MetalMirror<float> dataGpu(data), xGpu(x);
+      MetalStats s0 = metalStats();
       auto t0 = chrono::steady_clock::now();
       solver->factor(dataGpu.ptr());
       factorMs = msSince(t0);
+      MetalStats s1 = metalStats();
       t0 = chrono::steady_clock::now();
       solver->solve(dataGpu.ptr(), xGpu.ptr(), order, nRHS);
       solveMs = msSince(t0);
+      MetalStats s2 = metalStats();
+      e.factorGpuMs = (s1.gpuSeconds - s0.gpuSeconds) * 1e3;
+      e.solveGpuMs = (s2.gpuSeconds - s1.gpuSeconds) * 1e3;
+      e.factorDispatches = s1.dispatches - s0.dispatches;
+      e.solveDispatches = s2.dispatches - s1.dispatches;
+      e.factorCmdBufs = s1.commandBuffers - s0.commandBuffers;
+      e.solveCmdBufs = s2.commandBuffers - s1.commandBuffers;
       dataGpu.get(data);
       xGpu.get(x);
 #endif
@@ -246,7 +259,6 @@ Errors factorSolveErrors(BackendType backend, const Problem& prob, int nRHS, int
 
   MatD L = MatD(solver->skel().densify(data).cast<double>()).triangularView<Eigen::Lower>();
   MatD xm = Eigen::Map<Eigen::MatrixXf>(x.data(), order, nRHS).cast<double>();
-  Errors e;
   e.factor = (L - Lref).norm() / Lref.norm();
   e.solution = (xm - xRef).norm() / xRef.norm();
   e.residual = (A * xm - b).norm() / b.norm();
@@ -263,8 +275,15 @@ constexpr double kFactorTol = 2e-5;
 constexpr double kSolveTol = 2e-5;
 
 void checkErrors(const Errors& e, const char* what) {
-  printf("%s: factor %.2e, solution %.2e, residual %.2e (time: factor %.1f ms, solve %.1f ms)\n",
+  printf("%s: factor %.2e, solution %.2e, residual %.2e (time: factor %.1f ms, solve %.1f ms)",
          what, e.factor, e.solution, e.residual, e.factorMs, e.solveMs);
+  if (e.factorDispatches + e.solveDispatches > 0) {
+    printf(" (GPU: factor %.2f ms, %lld kernels, %lld cmd bufs; solve %.2f ms, %lld kernels, %lld "
+           "cmd bufs)",
+           e.factorGpuMs, (long long)e.factorDispatches, (long long)e.factorCmdBufs, e.solveGpuMs,
+           (long long)e.solveDispatches, (long long)e.solveCmdBufs);
+  }
+  printf("\n");
   EXPECT_LT(e.factor, kFactorTol) << what;
   EXPECT_LT(e.solution, kSolveTol) << what;
   EXPECT_LT(e.residual, kSolveTol) << what;
