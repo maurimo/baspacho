@@ -69,13 +69,18 @@ static Problem loadBal(const string& path, int camSize, int ptSize) {
   FILE* f = fopen(path.c_str(), "r");
   if (!f) throw runtime_error("cannot open " + path);
   long nCams, nPts, nObs;
-  if (fscanf(f, "%ld %ld %ld", &nCams, &nPts, &nObs) != 3) throw runtime_error("bad bal header");
+  if (fscanf(f, "%ld %ld %ld", &nCams, &nPts, &nObs) != 3 || nCams < 0 || nPts < 0 || nObs < 0) {
+    throw runtime_error("bad bal header");
+  }
   vector<pair<int64_t, int64_t>> pairs;
   pairs.reserve(nObs);
   for (long i = 0; i < nObs; i++) {
     long c, p;
     double x, y;
     if (fscanf(f, "%ld %ld %lf %lf", &c, &p, &x, &y) != 4) throw runtime_error("bad bal obs");
+    if (c < 0 || c >= nCams || p < 0 || p >= nPts) {
+      throw runtime_error("bal observation " + to_string(i) + " out of range");
+    }
     pairs.emplace_back(nPts + c, p);  // points first, then cameras
   }
   fclose(f);
@@ -99,14 +104,14 @@ static Problem loadG2o(const string& path) {
     ls >> tag;
     if (tag.rfind("VERTEX", 0) == 0) {
       int64_t id;
-      ls >> id;
+      if (!(ls >> id)) throw runtime_error("bad g2o vertex: " + line);
       int sz = tag.find("SE2") != string::npos || tag.find("XY") != string::npos ? 3 : 6;
       if (tag == "VERTEX_XY") sz = 2;
       if (tag == "VERTEX_TRACKXYZ" || tag == "VERTEX_POINT_XYZ") sz = 3;
       if (idToIdx.emplace(id, sizes.size()).second) sizes.push_back(sz);
     } else if (tag.rfind("EDGE", 0) == 0) {
       int64_t a, b;
-      ls >> a >> b;
+      if (!(ls >> a >> b)) throw runtime_error("bad g2o edge: " + line);
       edges.emplace_back(a, b);
       // some datasets have no VERTEX lines: infer vertices from edges
       int sz = tag.find("SE2") != string::npos ? 3 : 6;
@@ -135,7 +140,7 @@ static Problem loadMtx(const string& path, int maxBlock) {
   while (in.peek() == '%') getline(in, line);
   int64_t nr, nc, nnz;
   in >> nr >> nc >> nnz;
-  if (nr != nc) throw runtime_error("matrix not square");
+  if (!in || nr != nc || nr <= 0 || nnz < 0) throw runtime_error("bad mtx header");
   getline(in, line);
   vector<vector<int32_t>> adj(nr);  // full symmetric adjacency incl. diagonal
   for (int64_t k = 0; k < nnz; k++) {
@@ -144,6 +149,9 @@ static Problem loadMtx(const string& path, int maxBlock) {
     char* e;
     int64_t i = strtoll(s, &e, 10) - 1;
     int64_t j = strtoll(e, &e, 10) - 1;
+    if (i < 0 || i >= nr || j < 0 || j >= nr) {
+      throw runtime_error("mtx entry " + to_string(k) + " out of range: " + line);
+    }
     adj[i].push_back(j);
     if (i != j) adj[j].push_back(i);
   }
@@ -286,7 +294,8 @@ static uint64_t skelHash(const Solver& solver) {
 
 static double minOf(const vector<double>& v) { return *min_element(v.begin(), v.end()); }
 
-static void runBackend(const Problem& p, const Opts& o, BackendType backend, const string& label) {
+// returns false if the solution is inaccurate (or not finite)
+static bool runBackend(const Problem& p, const Opts& o, BackendType backend, const string& label) {
   Settings settings;
   settings.backend = backend;
   settings.numThreads = o.numThreads;
@@ -309,7 +318,7 @@ static void runBackend(const Problem& p, const Opts& o, BackendType backend, con
            minOf(vector<double>(tCreate.begin() + 1, tCreate.end())),
            (long long)solver->dataSize(), (long long)solver->skel().numLumps(),
            (unsigned long long)skelHash(*solver));
-    return;
+    return true;
   }
 
   auto acc = solver->accessor();
@@ -370,10 +379,12 @@ static void runBackend(const Problem& p, const Opts& o, BackendType backend, con
       (long long)solver->skel().numLumps(), solver->sparseEliminationRanges().size(), relErr,
       (unsigned long long)skelHash(*solver));
   fflush(stdout);
-  if (relErr > 1e-6) {
+  if (!(relErr <= 1e-6)) {  // also NaN
     fprintf(stderr, "ERROR: large relative error %g on %s/%s\n", relErr, p.name.c_str(),
             label.c_str());
+    return false;
   }
+  return true;
 }
 
 static void help() {
@@ -391,7 +402,7 @@ static void help() {
        << "  -maxbs n      max detected block size for -mtx (default 16)\n";
 }
 
-int main(int argc, char* argv[]) {
+static int run(int argc, char* argv[]) {
   Opts o;
   string bal, g2o, mtx, name;
   int64_t gridN = 0, gridBs = 3;
@@ -421,6 +432,10 @@ int main(int argc, char* argv[]) {
       return a == "-h" ? 0 : 1;
     }
   }
+  if (o.reps < 1 || o.numThreads < 1 || maxbs < 1 || gridN < 0 || gridBs < 1) {
+    fprintf(stderr, "invalid option: -reps, -t, -maxbs and the -grid3d sizes must be positive\n");
+    return 1;
+  }
   Problem p;
   auto t0 = hrc::now();
   if (!bal.empty()) p = loadBal(bal, 9, 3), p.name = bal;
@@ -439,7 +454,8 @@ int main(int argc, char* argv[]) {
           p.name.c_str(), p.paramSize.size(), (long long)totSize, p.ss.inds.size(),
           tdelta(hrc::now() - t0).count());
 
-  if (o.fast) runBackend(p, o, BackendFast, "fast" + to_string(o.numThreads));
+  bool ok = true;
+  if (o.fast) ok &= runBackend(p, o, BackendFast, "fast" + to_string(o.numThreads));
 #ifdef BASPACHO_USE_CUBLAS
   if (o.cuda) {
     {  // init cuda context outside of timings
@@ -447,7 +463,7 @@ int main(int argc, char* argv[]) {
       s.backend = BackendCuda;
       auto warm = createSolver(s, {1}, SparseStructure({0, 1}, {0}));
     }
-    runBackend(p, o, BackendCuda, "cuda");
+    ok &= runBackend(p, o, BackendCuda, "cuda");
   }
 #endif
 #ifdef BASPACHO_HAVE_CHOLMOD
@@ -457,5 +473,14 @@ int main(int argc, char* argv[]) {
            "cholmod", res.analysisTime, res.factorTime, res.analysisTime / res.factorTime);
   }
 #endif
-  return 0;
+  return ok ? 0 : 1;  // inaccurate solutions fail (eg. in CI)
+}
+
+int main(int argc, char* argv[]) {
+  try {
+    return run(argc, argv);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "ERROR: %s\n", e.what());
+    return 1;
+  }
 }
