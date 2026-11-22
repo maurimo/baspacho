@@ -253,9 +253,11 @@ struct Settings {
   // * Deep: as Fast, but on the structure of single parameters, from more starting points
   //   (including Exact's result, so it is never worse according to the model), followed by
   //   `deepSearchIterations` rounds of iterated local search. 3-10x slower than Fast.
-  // Estimated with sane computation models on a suite of 39 problems, the factorization is
-  // 3-13% faster with Fast than with Exact (geometric means for CPU, CUDA, Metal models), and Fast
-  // takes 0.4-0.55x the time of Exact; Deep is about as good as Fast.
+  // According to the computation models (39 problems), the factorization is 3-13% faster with
+  // Fast than with Exact, Deep about as Fast; Fast takes 0.4-0.55x the time of Exact. But measured
+  // on a CPU with a model fitted on it, the real factorization times of Fast, Deep and Exact are
+  // the same within noise (+-5%): the per-partition errors of the polynomial models (10-25%,
+  // depending on the shapes of the operations) exceed the gains, see the research notes.
   AnalysisMode analysis = AnalysisAuto;
   int deepSearchIterations = 0;
 };
