@@ -690,6 +690,8 @@ void EliminationTree::computeMergesOpt(const std::string& mode, const std::strin
     opt.greedy(passes);
   } else if (mode == "best") {
     opt.bestFirst(passes);
+  } else if (mode == "steep") {
+    opt.steepest();
   } else {
     BASPACHO_CHECK(mode == "coarse");  // no merges after the coarse partition
   }

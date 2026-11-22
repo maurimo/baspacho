@@ -6,6 +6,7 @@
  */
 
 #include "baspacho/baspacho/MergeOptimizer.h"
+#include <algorithm>
 #include <queue>
 #include <tuple>
 #include "baspacho/baspacho/DebugMacros.h"
@@ -203,6 +204,67 @@ void MergeOptimizer::bestFirst(int passes) {
     // (they are re-evaluated when popped, or by the final passes)
   }
   greedy(passes);
+}
+
+void MergeOptimizer::steepest() {
+  // children lumps of each lump
+  vector<vector<int64_t>> kids(numNodes);
+  auto isCandidate = [&](int64_t k) {
+    return mergeWith[k] == -1 && canMerge[k] && !sparse[k] && parent[k] != -1;
+  };
+  for (int64_t k = 0; k < numNodes; k++) {
+    if (mergeWith[k] == -1 && parent[k] != -1) {
+      kids[root(parent[k])].push_back(k);
+    }
+  }
+  // (-delta, k, version of k's entry): stale entries are skipped
+  vector<int64_t> version(numNodes, 0);
+  priority_queue<tuple<double, int64_t, int64_t>> heap;
+  auto push = [&](int64_t k) {
+    if (isCandidate(k)) {
+      heap.emplace(-mergeDelta(k, root(parent[k])), k, ++version[k]);
+    }
+  };
+  auto refreshAll = [&]() {
+    heap = decltype(heap)();
+    for (int64_t k = 0; k < numNodes; k++) {
+      push(k);
+    }
+  };
+  refreshAll();
+  while (true) {
+    if (heap.empty() || get<0>(heap.top()) <= 0) {
+      // no improving merge according to the (maybe stale) values: refresh all
+      refreshAll();
+      if (heap.empty() || get<0>(heap.top()) <= 0) {
+        break;
+      }
+    }
+    auto [negD, k, ver] = heap.top();
+    heap.pop();
+    if (ver != version[k] || !isCandidate(k)) {
+      continue;
+    }
+    int64_t p = root(parent[k]);
+    double d = mergeDelta(k, p);
+    if (!heap.empty() && -d < get<0>(heap.top())) {
+      heap.emplace(-d, k, ++version[k]);  // no longer the best
+      continue;
+    }
+    if (d >= 0) {
+      heap.emplace(-d, k, ++version[k]);
+      continue;  // (the refresh above decides when to stop)
+    }
+    applyMerge(k, p);
+    auto& pk = kids[p];
+    pk.erase(std::find(pk.begin(), pk.end(), k));
+    pk.insert(pk.end(), kids[k].begin(), kids[k].end());
+    kids[k] = vector<int64_t>();
+    push(p);
+    for (int64_t c : pk) {
+      push(c);
+    }
+  }
 }
 
 double MergeOptimizer::evaluate(const vector<vector<Board>>& colBoards) {

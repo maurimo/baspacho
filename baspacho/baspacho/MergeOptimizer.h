@@ -59,6 +59,11 @@ struct MergeOptimizer {
   // merges in the order of the best time decrease (lazy re-evaluation), then greedy passes
   void bestFirst(int passes);
 
+  // steepest descent: always applies the merge with the best (most negative) time change, the
+  // values being re-evaluated when popped, after the lump or the parent's lump changed, and all
+  // of them before stopping
+  void steepest();
+
   // total of the current partition, recomputed from scratch from the input boards
   double evaluate(const std::vector<std::vector<Board>>& colBoards);
 
