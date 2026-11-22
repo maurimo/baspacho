@@ -440,6 +440,7 @@ struct Opts {
   bool verbose = false;
   bool createOnly = false;
   vector<string> models;  // -model: estimate the factor time with computation models
+  bool fastOnly = false;  // -fastOnly: with -model, skip the exact analysis
 };
 
 static uint64_t hashVec(uint64_t h, const vector<int64_t>& v) {
@@ -561,7 +562,8 @@ static pair<double, double> modelledFactorTime(const Solver& solver,
 static const ComputationModel* namedModel(const string& name) {
   if (name == "cpu") return &ComputationModel::model_OpenBlas_i7_1185g7;
   if (name == "cuda") return &ComputationModel::model_Cuda117_2080Ti;
-  throw runtime_error("unknown model " + name + " (cpu, cuda)");
+  if (name == "metal") return &ComputationModel::model_Metal_CI_paravirtual;
+  throw runtime_error("unknown model " + name + " (cpu, cuda, metal)");
 }
 
 // for each model: analysis (exact with that model, and fast) and estimated factor time
@@ -570,6 +572,11 @@ static void runModels(const Problem& p, const Opts& o) {
     const ComputationModel* model = namedModel(m);
     printf("%-28s model=%-5s", p.name.c_str(), m.c_str());
     for (bool fast : {false, true}) {
+      if (!fast && o.fastOnly) {
+        printf(" exact: analysis=%9.4fs factor(model)=%9.4fs sparse(model)=%9.4fs nnzL=0 lumps=0 |",
+               0.0, 0.0, 0.0);
+        continue;
+      }
       Settings settings;
       settings.backend = BackendRef;  // not used: the analysis only depends on the model
       settings.numThreads = o.numThreads;
@@ -741,6 +748,7 @@ static int run(int argc, char* argv[]) {
     else if (a == "-mtx") mtx = next();
     else if (a == "-grid3d") gridN = stoi(next()), gridBs = stoi(next());
     else if (a == "-gen") genSpec = next();
+    else if (a == "-fastOnly") o.fastOnly = true;
     else if (a == "-model") {
       stringstream ms(next());
       string m;

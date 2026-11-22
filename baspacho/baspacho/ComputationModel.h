@@ -111,6 +111,7 @@ struct ComputationModel {
   // pre-built model collection
   static const ComputationModel model_OpenBlas_i7_1185g7;
   static const ComputationModel model_Cuda117_2080Ti;
+  static const ComputationModel model_Metal_CI_paravirtual;
 };
 
 }  // namespace BaSpaCho

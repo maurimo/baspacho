@@ -875,10 +875,11 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   timer.mark("permuteBR");
 
   // auto select computation model (for node merge heuristic), if not provided
-  const ComputationModel* compModel = settings.computationModel ? settings.computationModel
-                                      : settings.backend == BackendCuda
-                                          ? &ComputationModel::model_Cuda117_2080Ti
-                                          : &ComputationModel::model_OpenBlas_i7_1185g7;
+  const ComputationModel* compModel =
+      settings.computationModel           ? settings.computationModel
+      : settings.backend == BackendCuda  ? &ComputationModel::model_Cuda117_2080Ti
+      : settings.backend == BackendMetal ? &ComputationModel::model_Metal_CI_paravirtual
+                                         : &ComputationModel::model_OpenBlas_i7_1185g7;
 
   // compute as ordinary elimination tree on br-corner
   EliminationTree et(sortedBottomParamSize, sortedSsBottom, compModel);
