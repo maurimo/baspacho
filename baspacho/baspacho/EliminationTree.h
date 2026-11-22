@@ -66,15 +66,7 @@ struct EliminationTree {
   // how the merges are chosen by processTree. Auto: Optimized after buildTreeFast, Greedy after
   // buildTree. Relaxed: relaxed amalgamation (computeMergesFast). Greedy: computeMerges, greedy
   // on an estimate of the merge's effect on the two nodes. Optimized/Deep: computeMergesOptimized
-  // GreedyCorrected (for comparison): computeMerges' greedy procedure with the exact cost
-  enum MergeMode {
-    MergeAuto,
-    MergeRelaxed,
-    MergeGreedy,
-    MergeOptimized,
-    MergeDeep,
-    MergeGreedyCorrected
-  };
+  enum MergeMode { MergeAuto, MergeRelaxed, MergeGreedy, MergeOptimized, MergeDeep };
   MergeMode mergeMode = MergeAuto;
   int deepIterations = 0;     // MergeDeep: rounds of iterated local search
   double optimizedCost = -1;  // set by computeMergesOptimized: estimated time of the factor

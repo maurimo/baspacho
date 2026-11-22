@@ -676,23 +676,20 @@ static constexpr double kFundamentalCap = 32;
 
 void EliminationTree::computeMergesOptimized(MergeMode mode) {
   int64_t ord = ss.order();
-  bool greedyCorrected = mode == MergeGreedyCorrected;
-  bool deep = mode == MergeDeep || greedyCorrected;  // (span-level nodes)
+  bool deep = mode == MergeDeep;  // (span-level nodes)
 
   // starting partitions (span level); the nodes of the optimization are the intersection of the
   // partitions (connected subtrees: their intersections are connected), single spans for deep
   vector<vector<int64_t>> starts;
-  if (deep && !fastSymbolic && !greedyCorrected) {
+  if (deep && !fastSymbolic) {
     nodeSize = paramSize;
     computeMerges();  // (uses the structure of buildTree, first)
     starts.push_back(currentPartition(*this));
     nodeSize = paramSize;
   }
-  if (!greedyCorrected) {
-    starts.push_back(partitionFast(true, deep ? 1e30 : kFundamentalCap));
-    starts.push_back(partitionFast(false, 0));
-  }
-  if (deep && !greedyCorrected) {
+  starts.push_back(partitionFast(true, deep ? 1e30 : kFundamentalCap));
+  starts.push_back(partitionFast(false, 0));
+  if (deep) {
     starts.push_back(partitionFast(true, kFundamentalCap));
   }
   vector<int64_t> coarseOf(ord);
@@ -747,11 +744,7 @@ void EliminationTree::computeMergesOptimized(MergeMode mode) {
   for (auto& st : starts) {
     MergeOptimizer o = newOpt();
     replay(o, st);
-    if (greedyCorrected) {
-      o.greedy(1);
-    } else {
-      o.steepest();
-    }
+    o.steepest();
     if (first || o.total < bestCost) {
       first = false;
       bestCost = o.total;
@@ -765,7 +758,7 @@ void EliminationTree::computeMergesOptimized(MergeMode mode) {
   // experiments, ie. the steepest descent from the best start is close to a local optimum)
   std::mt19937_64 gen(17);
   std::uniform_real_distribution<double> unif(0.0, 1.0);
-  for (int it = 0; mode == MergeDeep && it < deepIterations; it++) {
+  for (int it = 0; deep && it < deepIterations; it++) {
     vector<bool> dissolve(numCoarse, false);
     for (int64_t a = 0; a < numCoarse; a++) {
       if (best[a] == a) dissolve[a] = unif(gen) < 0.2;

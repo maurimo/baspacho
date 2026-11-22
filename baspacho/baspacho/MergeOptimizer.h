@@ -51,20 +51,12 @@ struct MergeOptimizer {
 
   void applyMerge(int64_t k, int64_t p);
 
-  // (for comparison) the merge order of the previous analysis (child rows / parent rows,
-  // decreasing), merging when the time decreases; with `passes` > 1, the candidates are
-  // reconsidered until no merge is accepted (or the number of passes is reached)
-  void greedy(int passes);
-
   // steepest descent: always applies the merge with the best (most negative) time change, the
   // values being re-evaluated when popped, after the lump or the parent's lump changed, and all
   // of them before stopping
   // (with `noise` > 0 the merges are ranked by delta * (1 + noise * u), u uniform in [-1, 1],
   // only improving merges are applied)
   void steepest(double noise = 0, uint64_t seed = 0);
-
-  // total of the current partition, recomputed from scratch from the input boards
-  double evaluate(const std::vector<std::vector<Board>>& colBoards);
 
   double colCost(int64_t c, double n) const;
 
@@ -73,9 +65,6 @@ struct MergeOptimizer {
     return model.asmblEst(br, bc) + model.asmblElemEst(m, mFull);
   }
 
-  // set by evaluate: per operation (potrf, trsm, syge, asmbl) time and number of calls
-  double opTime[4] = {0, 0, 0, 0};
-  int64_t opCount[4] = {0, 0, 0, 0};
 
   const ComputationModel& model;
   int64_t numNodes;
@@ -88,7 +77,6 @@ struct MergeOptimizer {
   std::vector<Board> tmp;
   double total = 0;  // estimated time of the current partition
   int64_t numMerges = 0;
-  int64_t numEvals = 0;
 };
 
 }  // end namespace BaSpaCho

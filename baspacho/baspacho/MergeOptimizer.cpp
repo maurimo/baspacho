@@ -66,7 +66,6 @@ int64_t MergeOptimizer::root(int64_t a) {
 }
 
 double MergeOptimizer::mergeDelta(int64_t k, int64_t p) {
-  numEvals++;
   double delta = colCost(p, size[k] + size[p]) - colCost(k, size[k]) - colCost(p, size[p]);
   const auto& kB = perRow[k];
   const auto& pB = perRow[p];
@@ -98,7 +97,6 @@ double MergeOptimizer::mergeDelta(int64_t k, int64_t p) {
 
 void MergeOptimizer::applyMerge(int64_t k, int64_t p) {
   total += mergeDelta(k, p);
-  numEvals--;
   mergeWith[k] = p;
   size[p] += size[k];
   spans[p] += spans[k];
@@ -140,38 +138,6 @@ void MergeOptimizer::applyMerge(int64_t k, int64_t p) {
   }
   swap(pB, tmp);
   kB = vector<Board>();
-}
-
-void MergeOptimizer::greedy(int passes) {
-  auto pickUpScore = [&](int64_t k, int64_t p) -> double {
-    return ((double)rows[k]) / (rows[p] + size[p]);
-  };
-  for (int pass = 0; pass < passes; pass++) {
-    int64_t mergesBefore = numMerges;
-    priority_queue<tuple<double, int64_t, int64_t>> candidates;
-    for (int64_t k = numNodes - 1; k >= 0; k--) {
-      if (mergeWith[k] != -1 || !canMerge[k] || sparse[k] || parent[k] == -1) {
-        continue;
-      }
-      int64_t p = root(parent[k]);
-      candidates.emplace(pickUpScore(k, p), k, p);
-    }
-    while (!candidates.empty()) {
-      auto [score, k, p] = candidates.top();
-      candidates.pop();
-      int64_t rp = root(p);
-      if (rp != p) {
-        candidates.emplace(pickUpScore(k, rp), k, rp);
-        continue;
-      }
-      if (mergeDelta(k, p) < 0) {
-        applyMerge(k, p);
-      }
-    }
-    if (numMerges == mergesBefore) {
-      break;
-    }
-  }
 }
 
 void MergeOptimizer::steepest(double noise, uint64_t seed) {
@@ -237,50 +203,6 @@ void MergeOptimizer::steepest(double noise, uint64_t seed) {
       push(c);
     }
   }
-}
-
-double MergeOptimizer::evaluate(const vector<vector<Board>>& colBoards) {
-  double tot = 0;
-  for (int i = 0; i < 4; i++) {
-    opTime[i] = 0;
-    opCount[i] = 0;
-  }
-  for (int64_t c = 0; c < numNodes; c++) {
-    if (mergeWith[c] != -1 || sparse[c]) {
-      continue;
-    }
-    double n = size[c];
-    double t = model.potrfEst(n) + model.trsmEst(n, rows[c]);
-    opTime[0] += model.potrfEst(n);
-    opCount[0]++;
-    if (rows[c] > 0) {
-      opTime[1] += model.trsmEst(n, rows[c]);
-      opCount[1]++;
-    } else {
-      t -= model.trsmEst(n, 0);  // (no trsm without rows below the diagonal)
-    }
-    // group the boards of the top node by lump
-    const auto& bs = colBoards[c];
-    for (size_t i = 0; i < bs.size();) {
-      int64_t r = root(bs[i].c);
-      int64_t bc = 0, m = 0;
-      size_t j = i;
-      while (j < bs.size() && root(bs[j].c) == r) {
-        bc += bs[j].bc;
-        m += bs[j].m;
-        j++;
-      }
-      t += model.sygeEst(m, m + bs[j - 1].rowsDown, n) +
-           asmbl(bc + bs[j - 1].brDown, bc, m, m + bs[j - 1].rowsDown);
-      opTime[2] += model.sygeEst(m, m + bs[j - 1].rowsDown, n);
-      opTime[3] += asmbl(bc + bs[j - 1].brDown, bc, m, m + bs[j - 1].rowsDown);
-      opCount[2]++;
-      opCount[3]++;
-      i = j;
-    }
-    tot += t;
-  }
-  return tot;
 }
 
 }  // end namespace BaSpaCho
