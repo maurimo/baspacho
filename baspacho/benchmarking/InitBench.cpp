@@ -465,13 +465,15 @@ static uint64_t skelHash(const Solver& solver) {
 
 // "Model" backend: runs the factorization loops of the Solver on the skeleton only (no numeric
 // data is allocated, data pointers are null), adding the time estimated by a computation model
-// for each operation. The sparse elimination of a lump (not covered by the model) is estimated as
-// its potrf, the trsm and syrk of all the rows below, and the assembly of its blocks.
+// for each operation of the supernodal (dense) part. The sparse elimination (not covered by the
+// model, and batched on the GPU backends) is estimated separately, per lump, as its potrf, the
+// trsm and syrk of all the rows below, and the assembly of its blocks.
 struct ModelSymElimCtx : SymElimCtx {};
 
 struct ModelNumericCtx : NumericCtx<double> {
-  ModelNumericCtx(const CoalescedBlockMatrixSkel& skel, const ComputationModel& model, double& time)
-      : skel(skel), model(model), time(time) {}
+  ModelNumericCtx(const CoalescedBlockMatrixSkel& skel, const ComputationModel& model, double& time,
+                  double& sparseTime)
+      : skel(skel), model(model), time(time), sparseTime(sparseTime) {}
   void pseudoFactorSpans(double*, int64_t, int64_t) override {
     throw runtime_error("model backend: pseudoFactorSpans not supported");
   }
@@ -482,10 +484,10 @@ struct ModelNumericCtx : NumericCtx<double> {
       int64_t nDiag = skel.lumpToSpan[l + 1] - skel.lumpToSpan[l];
       double rows = skel.chainRowsTillEnd[c1 - 1] - skel.chainRowsTillEnd[c0 + nDiag - 1];
       double blocks = c1 - c0 - nDiag;
-      time += model.potrfEst(n);
+      sparseTime += model.potrfEst(n);
       if (blocks > 0) {
-        time += model.trsmEst(n, rows) + model.sygeEst(rows, rows, n) +
-                model.asmblEst(blocks, blocks);
+        sparseTime += model.trsmEst(n, rows) + model.sygeEst(rows, rows, n) +
+                      model.asmblEst(blocks, blocks);
       }
     }
   }
@@ -504,12 +506,13 @@ struct ModelNumericCtx : NumericCtx<double> {
   const CoalescedBlockMatrixSkel& skel;
   const ComputationModel& model;
   double& time;
+  double& sparseTime;
 };
 
 struct ModelSymbolicCtx : SymbolicCtx {
   ModelSymbolicCtx(const CoalescedBlockMatrixSkel& skel, const ComputationModel& model,
-                   double& time)
-      : skel(skel), model(model), time(time) {}
+                   double& time, double& sparseTime)
+      : skel(skel), model(model), time(time), sparseTime(sparseTime) {}
   SymElimCtxPtr prepareElimination(int64_t, int64_t) override {
     return SymElimCtxPtr(new ModelSymElimCtx);
   }
@@ -517,7 +520,7 @@ struct ModelSymbolicCtx : SymbolicCtx {
     if (tIdx != type_index(typeid(double))) {
       throw runtime_error("model backend: double only");
     }
-    return new ModelNumericCtx(skel, model, time);
+    return new ModelNumericCtx(skel, model, time, sparseTime);
   }
   SolveCtxBase* createSolveCtxForType(type_index, int, int) override {
     throw runtime_error("model backend: no solve");
@@ -526,28 +529,33 @@ struct ModelSymbolicCtx : SymbolicCtx {
   const CoalescedBlockMatrixSkel& skel;
   const ComputationModel& model;
   double& time;
+  double& sparseTime;
 };
 
 struct ModelOps : Ops {
-  ModelOps(const ComputationModel& model, double& time) : model(model), time(time) {}
+  ModelOps(const ComputationModel& model, double& time, double& sparseTime)
+      : model(model), time(time), sparseTime(sparseTime) {}
   SymbolicCtxPtr createSymbolicCtx(const CoalescedBlockMatrixSkel& skel,
                                    const vector<int64_t>&) override {
-    return SymbolicCtxPtr(new ModelSymbolicCtx(skel, model, time));
+    return SymbolicCtxPtr(new ModelSymbolicCtx(skel, model, time, sparseTime));
   }
   const ComputationModel& model;
   double& time;
+  double& sparseTime;
 };
 
-// time of the factorization of `solver`'s factor estimated by `model` (no data allocated)
-static double modelledFactorTime(const Solver& solver, const ComputationModel& model) {
-  double time = 0;
+// time of the factorization of `solver`'s factor estimated by `model` (no data allocated):
+// supernodal part, and estimate of the sparse elimination part
+static pair<double, double> modelledFactorTime(const Solver& solver,
+                                               const ComputationModel& model) {
+  double time = 0, sparseTime = 0;
   CoalescedBlockMatrixSkel skel = solver.skel();
   vector<int64_t> ranges = solver.sparseEliminationRanges();
   vector<int64_t> perm = solver.paramToSpan();
   Solver modelSolver(std::move(skel), std::move(ranges), std::move(perm),
-                     OpsPtr(new ModelOps(model, time)));
+                     OpsPtr(new ModelOps(model, time, sparseTime)));
   modelSolver.factor<double>(nullptr);
-  return time;
+  return {time, sparseTime};
 }
 
 static const ComputationModel* namedModel(const string& name) {
@@ -578,9 +586,10 @@ static void runModels(const Problem& p, const Opts& o) {
         solver = createSolver(settings, p.paramSize, p.ss, elimRanges);
         tCreate = min(tCreate, tdelta(hrc::now() - t0).count());
       }
-      printf(" %s: analysis=%9.4fs factor(model)=%9.4fs nnzL=%lld lumps=%lld |",
-             fast ? "fast" : "exact", tCreate, modelledFactorTime(*solver, *model),
-             (long long)solver->dataSize(), (long long)solver->skel().numLumps());
+      auto [tFactor, tSparse] = modelledFactorTime(*solver, *model);
+      printf(" %s: analysis=%9.4fs factor(model)=%9.4fs sparse(model)=%9.4fs nnzL=%lld lumps=%lld |",
+             fast ? "fast" : "exact", tCreate, tFactor, tSparse, (long long)solver->dataSize(),
+             (long long)solver->skel().numLumps());
     }
     printf("\n");
     fflush(stdout);
