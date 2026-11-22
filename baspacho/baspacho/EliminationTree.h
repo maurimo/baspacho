@@ -8,6 +8,7 @@
 #pragma once
 
 #include <Eigen/Geometry>
+#include <string>
 #include "baspacho/baspacho/SparseStructure.h"
 
 namespace BaSpaCho {
@@ -59,6 +60,15 @@ struct EliminationTree {
   void computeMergesFast();
 
   bool fastSymbolic = false;  // set by buildTreeFast
+  bool fundamentalOnly = false;  // computeMergesFast: only merges adding no explicit zeros
+
+  // (research) merges chosen by MergeOptimizer with the exact cost model, on top of a coarse
+  // partition ("none": spans, "fund": fundamental supernodes, "relax": relaxed amalgamation)
+  void computeMergesOpt(const std::string& mode, const std::string& coarse);
+
+  // (research) estimated time of the current merges, by the previous analyzer's bookkeeping
+  // (computeMerges) and by the exact cost (MergeOptimizer)
+  void debugMergeEstimates();
 
   // internal (called by processTree)
   void collapseMergePointers();
@@ -97,6 +107,7 @@ struct EliminationTree {
   std::vector<int64_t> sparseElimRanges;
   std::vector<std::tuple<int64_t, int64_t, int64_t>> unmergedHeightNode;
   std::vector<bool> forbidMerge;
+  std::vector<bool> isSparseElim;
   std::vector<int64_t> numMergedNodes;
   std::vector<int64_t> mergeWith;
   int64_t numMerges;

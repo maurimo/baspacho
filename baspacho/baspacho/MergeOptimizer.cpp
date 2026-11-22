@@ -1,0 +1,235 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+#include "baspacho/baspacho/MergeOptimizer.h"
+#include <queue>
+#include <tuple>
+#include "baspacho/baspacho/DebugMacros.h"
+
+namespace BaSpaCho {
+
+using namespace std;
+
+MergeOptimizer::MergeOptimizer(const ComputationModel& model, vector<int64_t> parent_,
+                               vector<int64_t> size_, vector<int64_t> spans_,
+                               vector<int64_t> rows_, vector<bool> canMerge_,
+                               vector<bool> sparse_, const vector<vector<Board>>& colBoards)
+    : model(model),
+      numNodes(parent_.size()),
+      parent(std::move(parent_)),
+      size(std::move(size_)),
+      spans(std::move(spans_)),
+      rows(std::move(rows_)),
+      canMerge(std::move(canMerge_)),
+      sparse(std::move(sparse_)) {
+  mergeWith.assign(numNodes, -1);
+  perRow.resize(numNodes);
+  colSyge.assign(numNodes, Eigen::Vector2d::Zero());
+  colAsmbl.assign(numNodes, 0.0);
+  for (int64_t c = 0; c < numNodes; c++) {
+    if (sparse[c]) {
+      continue;  // sparse elimination: not part of the supernodal factor
+    }
+    for (const Board& b : colBoards[c]) {
+      BASPACHO_CHECK_GT(b.c, c);
+      perRow[b.c].push_back(Board{c, b.bc, b.m, b.brDown, b.rowsDown});
+      colSyge[c] += model.sygeLinEst(b.m, b.m + b.rowsDown);
+      colAsmbl[c] += model.asmblEst(b.bc + b.brDown, b.bc);
+    }
+    total += colCost(c, size[c]);
+  }
+}
+
+double MergeOptimizer::colCost(int64_t c, double n) const {
+  return model.potrfEst(n) + model.trsmEst(n, rows[c]) + colSyge[c][0] + colSyge[c][1] * n +
+         colAsmbl[c];
+}
+
+int64_t MergeOptimizer::root(int64_t a) {
+  int64_t r = a;
+  while (mergeWith[r] != -1) {
+    r = mergeWith[r];
+  }
+  while (a != r) {
+    int64_t next = mergeWith[a];
+    mergeWith[a] = r;
+    a = next;
+  }
+  return r;
+}
+
+double MergeOptimizer::mergeDelta(int64_t k, int64_t p) {
+  numEvals++;
+  double delta = colCost(p, size[k] + size[p]) - colCost(k, size[k]) - colCost(p, size[p]);
+  const auto& kB = perRow[k];
+  const auto& pB = perRow[p];
+  for (size_t ik = 0, ip = 0; ik < kB.size() && ip < pB.size();) {
+    if (kB[ik].c < pB[ip].c) {
+      ik++;
+    } else if (kB[ik].c > pB[ip].c) {
+      ip++;
+    } else {
+      int64_t c = kB[ik].c;
+      if (mergeWith[c] == -1) {
+        const Board& e1 = kB[ik];
+        const Board& e2 = pB[ip];
+        double n = size[c];
+        delta += model.sygeEst(e1.m + e2.m, e1.m + e2.m + e2.rowsDown, n) +
+                 model.asmblEst(e1.bc + e2.bc + e2.brDown, e1.bc + e2.bc) -
+                 model.sygeEst(e1.m, e1.m + e1.rowsDown, n) -
+                 model.asmblEst(e1.bc + e1.brDown, e1.bc) -
+                 model.sygeEst(e2.m, e2.m + e2.rowsDown, n) -
+                 model.asmblEst(e2.bc + e2.brDown, e2.bc);
+      }
+      ik++;
+      ip++;
+    }
+  }
+  return delta;
+}
+
+void MergeOptimizer::applyMerge(int64_t k, int64_t p) {
+  total += mergeDelta(k, p);
+  numEvals--;
+  mergeWith[k] = p;
+  size[p] += size[k];
+  spans[p] += spans[k];
+  numMerges++;
+
+  auto& kB = perRow[k];
+  auto& pB = perRow[p];
+  tmp.clear();
+  tmp.reserve(kB.size() + pB.size());
+  auto alive = [&](int64_t c) { return mergeWith[c] == -1; };  // (k is no longer alive)
+  for (size_t ik = 0, ip = 0; ik < kB.size() || ip < pB.size();) {
+    if (ip >= pB.size() || (ik < kB.size() && kB[ik].c < pB[ip].c)) {
+      if (alive(kB[ik].c)) {
+        tmp.push_back(kB[ik]);
+      }
+      ik++;
+    } else if (ik >= kB.size() || kB[ik].c > pB[ip].c) {
+      if (alive(pB[ip].c)) {
+        tmp.push_back(pB[ip]);
+      }
+      ip++;
+    } else {
+      int64_t c = kB[ik].c;
+      if (alive(c)) {
+        const Board& e1 = kB[ik];
+        const Board& e2 = pB[ip];
+        Board m{c, e1.bc + e2.bc, e1.m + e2.m, e2.brDown, e2.rowsDown};
+        colSyge[c] += model.sygeLinEst(m.m, m.m + m.rowsDown) -
+                      model.sygeLinEst(e1.m, e1.m + e1.rowsDown) -
+                      model.sygeLinEst(e2.m, e2.m + e2.rowsDown);
+        colAsmbl[c] += model.asmblEst(m.bc + m.brDown, m.bc) -
+                       model.asmblEst(e1.bc + e1.brDown, e1.bc) -
+                       model.asmblEst(e2.bc + e2.brDown, e2.bc);
+        tmp.push_back(m);
+      }
+      ik++;
+      ip++;
+    }
+  }
+  swap(pB, tmp);
+  kB = vector<Board>();
+}
+
+void MergeOptimizer::greedy(int passes) {
+  auto pickUpScore = [&](int64_t k, int64_t p) -> double {
+    return ((double)rows[k]) / (rows[p] + size[p]);
+  };
+  for (int pass = 0; pass < passes; pass++) {
+    int64_t mergesBefore = numMerges;
+    priority_queue<tuple<double, int64_t, int64_t>> candidates;
+    for (int64_t k = numNodes - 1; k >= 0; k--) {
+      if (mergeWith[k] != -1 || !canMerge[k] || sparse[k] || parent[k] == -1) {
+        continue;
+      }
+      int64_t p = root(parent[k]);
+      candidates.emplace(pickUpScore(k, p), k, p);
+    }
+    while (!candidates.empty()) {
+      auto [score, k, p] = candidates.top();
+      candidates.pop();
+      int64_t rp = root(p);
+      if (rp != p) {
+        candidates.emplace(pickUpScore(k, rp), k, rp);
+        continue;
+      }
+      if (mergeDelta(k, p) < 0) {
+        applyMerge(k, p);
+      }
+    }
+    if (numMerges == mergesBefore) {
+      break;
+    }
+  }
+}
+
+void MergeOptimizer::bestFirst(int passes) {
+  // (delta, k): max-heap on -delta; deltas only re-evaluated when popped (lazy)
+  priority_queue<pair<double, int64_t>> candidates;
+  for (int64_t k = 0; k < numNodes; k++) {
+    if (!canMerge[k] || sparse[k] || parent[k] == -1) {
+      continue;
+    }
+    double d = mergeDelta(k, root(parent[k]));
+    if (d < 0) {
+      candidates.emplace(-d, k);
+    }
+  }
+  while (!candidates.empty()) {
+    auto [negD, k] = candidates.top();
+    candidates.pop();
+    if (mergeWith[k] != -1) {
+      continue;
+    }
+    int64_t p = root(parent[k]);
+    double d = mergeDelta(k, p);
+    if (d >= 0) {
+      continue;  // re-inserted if a later merge makes it convenient again (greedy passes)
+    }
+    if (!candidates.empty() && -d < candidates.top().first) {
+      candidates.emplace(-d, k);  // no longer the best, re-queue with the current value
+      continue;
+    }
+    applyMerge(k, p);
+    // the merged lump's children may have a different value now
+    // (they are re-evaluated when popped, or by the final passes)
+  }
+  greedy(passes);
+}
+
+double MergeOptimizer::evaluate(const vector<vector<Board>>& colBoards) {
+  double tot = 0;
+  for (int64_t c = 0; c < numNodes; c++) {
+    if (mergeWith[c] != -1 || sparse[c]) {
+      continue;
+    }
+    double n = size[c];
+    double t = model.potrfEst(n) + model.trsmEst(n, rows[c]);
+    // group the boards of the top node by lump
+    const auto& bs = colBoards[c];
+    for (size_t i = 0; i < bs.size();) {
+      int64_t r = root(bs[i].c);
+      int64_t bc = 0, m = 0;
+      size_t j = i;
+      while (j < bs.size() && root(bs[j].c) == r) {
+        bc += bs[j].bc;
+        m += bs[j].m;
+        j++;
+      }
+      t += model.sygeEst(m, m + bs[j - 1].rowsDown, n) +
+           model.asmblEst(bc + bs[j - 1].brDown, bc);
+      i = j;
+    }
+    tot += t;
+  }
+  return tot;
+}
+
+}  // end namespace BaSpaCho
