@@ -118,6 +118,199 @@ void EliminationTree::buildTree() {
   }
 }
 
+void EliminationTree::buildTreeFast() {
+  int64_t ord = ss.order();
+  fastSymbolic = true;
+  nodeSize = paramSize;
+
+  // elimination tree (Liu, with path compression), ss is the lower half by rows
+  parent.assign(ord, -1);
+  vector<int64_t> ancestor(ord, -1);
+  for (int64_t k = 0; k < ord; k++) {
+    for (int64_t q = ss.ptrs[k], qEnd = ss.ptrs[k + 1]; q < qEnd; q++) {
+      for (int64_t i = ss.inds[q], inext; i != -1 && i < k; i = inext) {
+        inext = ancestor[i];
+        ancestor[i] = k;
+        if (inext == -1) {
+          parent[i] = k;
+        }
+      }
+    }
+  }
+
+  // postorder (iterative dfs on the children lists)
+  vector<int64_t> head(ord, -1), next(ord, -1), post(ord), stack;
+  for (int64_t j = ord - 1; j >= 0; j--) {
+    if (parent[j] != -1) {
+      next[j] = head[parent[j]];
+      head[parent[j]] = j;
+    }
+  }
+  int64_t k = 0;
+  for (int64_t r = 0; r < ord; r++) {
+    if (parent[r] != -1) {
+      continue;
+    }
+    stack.push_back(r);
+    while (!stack.empty()) {
+      int64_t p = stack.back();
+      int64_t c = head[p];
+      if (c == -1) {
+        stack.pop_back();
+        post[k++] = p;
+      } else {
+        head[p] = next[c];
+        stack.push_back(c);
+      }
+    }
+  }
+  BASPACHO_CHECK_EQ(k, ord);
+
+  // columns of the lower half: rows i > j having an entry in column j
+  vector<int64_t> colPtr(ord + 1, 0), colRows;
+  for (int64_t r = 0; r < ord; r++) {
+    for (int64_t q = ss.ptrs[r], qEnd = ss.ptrs[r + 1]; q < qEnd; q++) {
+      if (ss.inds[q] < r) {
+        colPtr[ss.inds[q] + 1]++;
+      }
+    }
+  }
+  for (int64_t j = 0; j < ord; j++) {
+    colPtr[j + 1] += colPtr[j];
+  }
+  colRows.resize(colPtr[ord]);
+  {
+    vector<int64_t> pos(colPtr.begin(), colPtr.end() - 1);
+    for (int64_t r = 0; r < ord; r++) {
+      for (int64_t q = ss.ptrs[r], qEnd = ss.ptrs[r + 1]; q < qEnd; q++) {
+        if (ss.inds[q] < r) {
+          colRows[pos[ss.inds[q]]++] = r;
+        }
+      }
+    }
+  }
+
+  // column counts (Gilbert-Ng-Peyton, as cs_counts), both in blocks and weighted by the param
+  // sizes (scalar rows): count(j) = sum over the rows i whose row subtree contains j
+  vector<int64_t> first(ord, -1), maxfirst(ord, -1), prevleaf(ord, -1);
+  vector<int64_t> delta(ord, 0), wdelta(ord, 0);
+  for (int64_t i = 0; i < ord; i++) {
+    ancestor[i] = i;
+  }
+  for (int64_t kk = 0; kk < ord; kk++) {
+    int64_t j = post[kk];
+    if (first[j] == -1) {  // j is a leaf
+      delta[j] = 1;
+      wdelta[j] = paramSize[j];
+    }
+    for (; j != -1 && first[j] == -1; j = parent[j]) {
+      first[j] = kk;
+    }
+  }
+  for (int64_t kk = 0; kk < ord; kk++) {
+    int64_t j = post[kk];
+    if (parent[j] != -1) {
+      delta[parent[j]]--;
+      wdelta[parent[j]] -= paramSize[j];
+    }
+    for (int64_t q = colPtr[j], qEnd = colPtr[j + 1]; q < qEnd; q++) {
+      int64_t i = colRows[q];
+      if (first[j] <= maxfirst[i]) {
+        continue;  // A(i,j) is not a leaf of the row subtree of i
+      }
+      maxfirst[i] = first[j];
+      int64_t jprev = prevleaf[i];
+      prevleaf[i] = j;
+      delta[j]++;
+      wdelta[j] += paramSize[i];
+      if (jprev != -1) {  // subtract at the least common ancestor of jprev and j
+        int64_t lca = jprev;
+        while (lca != ancestor[lca]) {
+          lca = ancestor[lca];
+        }
+        for (int64_t s = jprev, sparent; s != lca; s = sparent) {
+          sparent = ancestor[s];
+          ancestor[s] = lca;
+        }
+        delta[lca]--;
+        wdelta[lca] -= paramSize[i];
+      }
+    }
+    if (parent[j] != -1) {
+      ancestor[j] = parent[j];
+    }
+  }
+  for (int64_t kk = 0; kk < ord; kk++) {  // sum the deltas over the subtrees
+    int64_t j = post[kk];
+    if (parent[j] != -1) {
+      delta[parent[j]] += delta[j];
+      wdelta[parent[j]] += wdelta[j];
+    }
+  }
+  nodeRowBlocks.resize(ord);
+  nodeRows.resize(ord);
+  for (int64_t j = 0; j < ord; j++) {
+    nodeRowBlocks[j] = delta[j] - 1;  // below the diagonal
+    nodeRows[j] = wdelta[j] - paramSize[j];
+  }
+}
+
+double EliminationTree::estimatedNodeCost(double size, double rows, double blocks,
+                                          double merged) const {
+  // syrk/gemm: for the q-th block from the bottom (rows a = rows / blocks): sygeLinEst(q*a, a)
+  // asmbl: for the q-th block from the bottom, asmblLinEst(q); closed form sums over q = 1..b
+  const auto& sp = compMod.sygeParams;
+  const auto& ap = compMod.asmblParams;
+  double b = blocks, a = blocks > 0 ? rows / blocks : 0.0, tri = b * (b + 1) / 2;
+  double sumMN = a * (tri + b), sumMxN = a * a * tri;
+  double syge0 = b * sp[0] + sumMN * sp[1] + sumMxN * sp[2];
+  double syge1 = b * sp[3] + sumMN * sp[4] + sumMxN * sp[5];
+  double asmbl0 = b * ap[0] + tri * ap[1];
+  double asmbl1 = b * ap[2] + tri * ap[3];
+  return compMod.potrfEst(size) + compMod.trsmEst(size, rows) + syge0 + syge1 * size + asmbl0 +
+         asmbl1 * merged;
+}
+
+void EliminationTree::computeMergesFast() {
+  int64_t ord = ss.order();
+  numMergedNodes.assign(ord, 1);
+  mergeWith.assign(ord, -1);
+  numMerges = 0;
+
+  auto pickUpScore = [&](int64_t k, int64_t p) -> double {
+    return ((double)nodeRows[k]) / (nodeRows[p] + nodeSize[p]);
+  };
+  priority_queue<tuple<double, int64_t, int64_t>> mergeCandidates;
+  for (int64_t k = ord - 1; k >= 0; k--) {
+    if (forbidMerge[k] || parent[k] == -1) {
+      continue;
+    }
+    mergeCandidates.emplace(pickUpScore(k, parent[k]), k, parent[k]);
+  }
+  while (!mergeCandidates.empty()) {
+    auto [score, k, p] = mergeCandidates.top();
+    mergeCandidates.pop();
+    int64_t oldP = p;
+    while (mergeWith[p] != -1) {
+      p = mergeWith[p];
+    }
+    if (oldP != p) {  // parent was merged, re-prioritize
+      mergeCandidates.emplace(pickUpScore(k, p), k, p);
+      continue;
+    }
+    double tk = estimatedNodeCost(nodeSize[k], nodeRows[k], nodeRowBlocks[k], numMergedNodes[k]);
+    double tp = estimatedNodeCost(nodeSize[p], nodeRows[p], nodeRowBlocks[p], numMergedNodes[p]);
+    double tm = estimatedNodeCost(nodeSize[p] + nodeSize[k], nodeRows[p], nodeRowBlocks[p],
+                                  numMergedNodes[p] + numMergedNodes[k]);
+    if (tm < tk + tp) {
+      mergeWith[k] = p;
+      nodeSize[p] += nodeSize[k];
+      numMergedNodes[p] += numMergedNodes[k];
+      numMerges++;
+    }
+  }
+}
+
 // Compute node heights:
 // depending on the structure of the matrix, if we have many small leaf
 // nodes (height = 0) we can eliminate them with a sparse elimination
@@ -349,7 +542,11 @@ void EliminationTree::processTree(bool detectSparseElimRanges, const vector<int6
     numMergedNodes.assign(ord, 1);
     numMerges = 0;
   } else {
-    computeMerges();
+    if (fastSymbolic) {
+      computeMergesFast();
+    } else {
+      computeMerges();
+    }
     collapseMergePointers();
   }
 

@@ -80,3 +80,23 @@ TEST(EliminationTree, Build) {
     }
   }
 }
+
+// buildTreeFast (elimination tree + column counts) gives the same tree and row counts as the
+// exact buildTree, on random structures with and without a fill reducing permutation
+TEST(EliminationTree, FastCountsMatchExact) {
+  for (int i = 0; i < 40; i++) {
+    auto colBlocks = randomCols(80 + 3 * i, 0.02 + 0.002 * i, 57 + i);
+    SparseStructure ss = columnsToCscStruct(colBlocks).transpose();
+    if (i % 2) {
+      vector<int64_t> perm = ss.fillReducingPermutation();
+      ss = ss.symmetricPermutation(inversePermutation(perm), false);
+    }
+    vector<int64_t> paramSize = randomVec(ss.ptrs.size() - 1, 2, 5, 47 + i);
+    EliminationTree exact(paramSize, ss), fast(paramSize, ss);
+    exact.buildTree();
+    fast.buildTreeFast();
+    ASSERT_EQ(exact.parent, fast.parent) << "problem " << i;
+    ASSERT_EQ(exact.nodeRowBlocks, fast.nodeRowBlocks) << "problem " << i;
+    ASSERT_EQ(exact.nodeRows, fast.nodeRows) << "problem " << i;
+  }
+}
