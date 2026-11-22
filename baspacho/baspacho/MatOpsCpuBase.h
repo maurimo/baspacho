@@ -51,30 +51,6 @@ struct CpuBaseSymbolicCtx : SymbolicCtx {
     throw std::runtime_error("no device accessor can be create from cpu-only backed!");
   }
 
-  static int64_t computeMaxBufSize(const CpuBaseSymElimCtx& elim,
-                                   const CoalescedBlockMatrixSkel& skel, int64_t sRel) {
-    int64_t maxBufferSize = 0;
-
-    // iterate over chains present in this row
-    for (int64_t i = elim.rowPtr[sRel], iEnd = elim.rowPtr[sRel + 1]; i < iEnd; i++) {
-      int64_t lump = elim.colLump[i];
-      int64_t chainColOrd = elim.chainColOrd[i];
-      BASPACHO_CHECK_GE(chainColOrd,
-                        1);  // there must be a diagonal block
-
-      int64_t ptrStart = skel.chainColPtr[lump] + chainColOrd;
-      int64_t ptrEnd = skel.chainColPtr[lump + 1];
-
-      int64_t nRowsAbove = skel.chainRowsTillEnd[ptrStart - 1];
-      int64_t nRowsChain = skel.chainRowsTillEnd[ptrStart] - nRowsAbove;
-      int64_t nRowsOnward = skel.chainRowsTillEnd[ptrEnd - 1];
-
-      maxBufferSize = std::max(maxBufferSize, nRowsOnward * nRowsChain);
-    }
-
-    return maxBufferSize;
-  }
-
   virtual SymElimCtxPtr prepareElimination(int64_t lumpsBegin, int64_t lumpsEnd) override {
     CpuBaseSymElimCtx* elim = new CpuBaseSymElimCtx;
 
@@ -110,18 +86,29 @@ struct CpuBaseSymbolicCtx : SymbolicCtx {
     rewindVec(elim->rowPtr);
     elim->spanRowBegin = spanRowBegin;
 
-    int64_t numRows = (int64_t)elim->rowPtr.size() - 1;
+    // max over the chains below the diagonal in the range of (rows of the column) * (rows of the
+    // chain), ie computeMaxBufSize over all the rows, computed by columns (sequential access)
     constexpr int64_t kChunk = 1024;
-    std::vector<int64_t> chunkMax((numRows + kChunk - 1) / kChunk, 0);
+    int64_t numLumpsElim = lumpsEnd - lumpsBegin;
+    std::vector<int64_t> chunkMax((numLumpsElim + kChunk - 1) / kChunk, 0);
     analysisParallelFor(0L, (int64_t)chunkMax.size(), 1L, [&](int64_t c0, int64_t c1) {
-          for (int64_t c = c0; c < c1; c++) {
-            int64_t m = 0;
-            for (int64_t r = c * kChunk, rEnd = std::min(numRows, (c + 1) * kChunk); r < rEnd; r++) {
-              m = std::max(m, computeMaxBufSize(*elim, skel, r));
+      for (int64_t c = c0; c < c1; c++) {
+        int64_t m = 0;
+        for (int64_t l = lumpsBegin + c * kChunk, lEnd = std::min(lumpsEnd, l + kChunk); l < lEnd;
+             l++) {
+          int64_t colStart = skel.chainColPtr[l], colEnd = skel.chainColPtr[l + 1];
+          int64_t nRowsOnward = skel.chainRowsTillEnd[colEnd - 1];
+          for (int64_t i = colStart + 1; i < colEnd; i++) {
+            if (skel.chainRowSpan[i] < spanRowBegin) {
+              continue;
             }
-            chunkMax[c] = m;
+            int64_t nRowsChain = skel.chainRowsTillEnd[i] - skel.chainRowsTillEnd[i - 1];
+            m = std::max(m, nRowsOnward * nRowsChain);
           }
-        });
+        }
+        chunkMax[c] = m;
+      }
+    });
     elim->maxBufferSize = 0;
     for (int64_t m : chunkMax) {
       elim->maxBufferSize = std::max(elim->maxBufferSize, m);

@@ -178,26 +178,61 @@ SparseStructure SparseStructure::addIndependentEliminationFill(int64_t elimStart
   // elimRows[elimPtrs[i - elimStart]...] are the rows having an entry in column i,
   // sorted because rows are visited in increasing order.
   int64_t numElim = elimEnd - elimStart;
-  vector<int64_t> elimPtrs(numElim + 1, 0);
+  vector<int64_t> elimPtrs(numElim + 1, 0), lastRow(numElim, -1);  // lastRow: skip duplicates
   for (int64_t k = elimEnd; k < ord; k++) {
     for (int64_t q = ptrs[k], qEnd = ptrs[k + 1]; q < qEnd; q++) {
       int64_t i = inds[q];
-      if (i >= elimStart && i < elimEnd) {
+      if (i >= elimStart && i < elimEnd && lastRow[i - elimStart] != k) {
+        lastRow[i - elimStart] = k;
         elimPtrs[i - elimStart]++;
       }
     }
   }
   int64_t numElimEntries = cumSumVec(elimPtrs);
   vector<int64_t> elimRows(numElimEntries);
+  lastRow.assign(numElim, -1);
   for (int64_t k = elimEnd; k < ord; k++) {
     for (int64_t q = ptrs[k], qEnd = ptrs[k + 1]; q < qEnd; q++) {
       int64_t i = inds[q];
-      if (i >= elimStart && i < elimEnd) {
+      if (i >= elimStart && i < elimEnd && lastRow[i - elimStart] != k) {
+        lastRow[i - elimStart] = k;
         elimRows[elimPtrs[i - elimStart]++] = k;
       }
     }
   }
   rewindVec(elimPtrs);
+
+  // The fill: pairs (k, w), elimEnd <= w < k, of rows having an entry in the same eliminated
+  // column. If they fit in memory they are generated column by column (sequential access) into
+  // per-row buckets, else each row walks the columns of its eliminated entries (random access)
+  int64_t numRows0 = ord - elimEnd, numPairs = 0;
+  for (int64_t c = 0; c < numElim; c++) {
+    int64_t d = elimPtrs[c + 1] - elimPtrs[c];
+    numPairs += d * (d - 1) / 2;
+  }
+  constexpr int64_t kMaxBucketPairs = int64_t(1) << 26;  // 256MB of int32 entries
+  const bool buckets = numPairs <= kMaxBucketPairs && numRows0 < (int64_t(1) << 31);
+  vector<int64_t> fillPtr;
+  vector<int32_t> fillRows;  // relative to elimEnd
+  if (buckets) {
+    fillPtr.assign(numRows0 + 1, 0);
+    for (int64_t c = 0; c < numElim; c++) {
+      for (int64_t b = elimPtrs[c] + 1; b < elimPtrs[c + 1]; b++) {
+        fillPtr[elimRows[b] - elimEnd + 1] += b - elimPtrs[c];  // all the rows before it
+      }
+    }
+    cumSumVec(fillPtr);
+    fillRows.resize(fillPtr[numRows0]);
+    for (int64_t c = 0; c < numElim; c++) {
+      for (int64_t b = elimPtrs[c] + 1; b < elimPtrs[c + 1]; b++) {
+        int64_t& pos = fillPtr[elimRows[b] - elimEnd];
+        for (int64_t a = elimPtrs[c]; a < b; a++) {
+          fillRows[pos++] = (int32_t)(elimRows[a] - elimEnd);
+        }
+      }
+    }
+    rewindVec(fillPtr);
+  }
 
   // compute rows >= elimEnd in parallel, in chunks. Row k contains the original
   // entries with column < elimEnd, followed by the union (sorted) of the original
@@ -235,7 +270,18 @@ SparseStructure SparseStructure::addIndependentEliminationFill(int64_t elimStart
               std::sort(low.begin(), low.end());
               low.erase(std::unique(low.begin(), low.end()), low.end());
             }
-            for (int64_t i : low) {
+            if (buckets) {
+              out.insert(out.end(), low.begin(), low.end());
+              for (int64_t q = fillPtr[k - elimEnd], qEnd = fillPtr[k - elimEnd + 1]; q < qEnd;
+                   q++) {
+                int64_t w = fillRows[q] + elimEnd;
+                if (tags[w - elimEnd] != k) {
+                  tags[w - elimEnd] = k;
+                  high.push_back(w);
+                }
+              }
+            }
+            for (int64_t i : buckets ? std::vector<int64_t>() : low) {
               out.push_back(i);
               if (i >= elimStart) {  // walk rows of elim column i, below k
                 for (int64_t t = elimPtrs[i - elimStart], tEnd = elimPtrs[i - elimStart + 1];
