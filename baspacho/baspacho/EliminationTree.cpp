@@ -8,7 +8,7 @@
 #include "baspacho/baspacho/EliminationTree.h"
 #include "baspacho/baspacho/MergeOptimizer.h"
 #include <algorithm>
-#include <map>
+#include <unordered_map>
 #include <queue>
 #include <random>
 #include <tuple>
@@ -529,7 +529,7 @@ namespace {
 // nodes increasing with their top span): structure of each coarse node computed as the union of
 // the entries of A in its columns and of the structures of its children (as computeAggregateStruct)
 struct OptInput {
-  std::vector<int64_t> parent, size, spans, rows, top;
+  std::vector<int64_t> parent, size, rows, top;
   std::vector<bool> canMerge, sparse;
   std::vector<std::vector<MergeOptimizer::Board>> colBoards;
 };
@@ -542,12 +542,10 @@ OptInput buildOptInput(const SparseStructure& ss, const vector<int64_t>& paramSi
   OptInput in;
   in.top.assign(numCoarse, -1);
   in.size.assign(numCoarse, 0);
-  in.spans.assign(numCoarse, 0);
   for (int64_t s = 0; s < ord; s++) {
     int64_t a = coarseOf[s];
     in.top[a] = std::max(in.top[a], s);
     in.size[a] += paramSize[s];
-    in.spans[a]++;
   }
   in.parent.resize(numCoarse);
   in.canMerge.resize(numCoarse);
@@ -704,10 +702,11 @@ void EliminationTree::computeMergesOptimized(MergeMode mode) {
     // label = (fundamental root, relaxed root); ids increasing with the top span of the group
     const auto& fund = starts[0];
     const auto& relax = starts[1];
-    std::map<pair<int64_t, int64_t>, int64_t> labelOf;
+    std::unordered_map<int64_t, int64_t> labelOf;  // (fund * ord + relax) -> label
+    labelOf.reserve(ord);
     vector<int64_t> label(ord), labelTop;
     for (int64_t s = 0; s < ord; s++) {
-      auto [it, isNew] = labelOf.emplace(make_pair(fund[s], relax[s]), labelTop.size());
+      auto [it, isNew] = labelOf.emplace(fund[s] * ord + relax[s], labelTop.size());
       if (isNew) labelTop.push_back(-1);
       label[s] = it->second;
       labelTop[label[s]] = std::max(labelTop[label[s]], s);
@@ -724,7 +723,7 @@ void EliminationTree::computeMergesOptimized(MergeMode mode) {
   OptInput in = buildOptInput(ss, paramSize, parent, coarseOf, numCoarse, forbidMerge,
                               isSparseElim);
   auto newOpt = [&]() {
-    return MergeOptimizer(compMod, in.parent, in.size, in.spans, in.rows, in.canMerge, in.sparse,
+    return MergeOptimizer(compMod, in.parent, in.size, in.rows, in.canMerge, in.sparse,
                           in.colBoards);
   };
   // merges of a (span-level) partition of which the nodes are a refinement

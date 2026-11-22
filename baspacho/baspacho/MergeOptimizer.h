@@ -39,7 +39,7 @@ struct MergeOptimizer {
 
   // `colBoards[a]`: boards of column a, by row node (`Board::c` = row node), in order
   MergeOptimizer(const ComputationModel& model, std::vector<int64_t> parent,
-                 std::vector<int64_t> size, std::vector<int64_t> spans, std::vector<int64_t> rows,
+                 std::vector<int64_t> size, std::vector<int64_t> rows,
                  std::vector<bool> canMerge, std::vector<bool> sparse,
                  const std::vector<std::vector<Board>>& colBoards);
 
@@ -68,7 +68,7 @@ struct MergeOptimizer {
 
   const ComputationModel& model;
   int64_t numNodes;
-  std::vector<int64_t> parent, size, spans, rows;
+  std::vector<int64_t> parent, size, rows;
   std::vector<bool> canMerge, sparse;
   std::vector<int64_t> mergeWith;
   std::vector<std::vector<Board>> perRow;  // boards in row node r, by column (alive ones valid)
