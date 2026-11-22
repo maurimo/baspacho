@@ -442,6 +442,7 @@ struct Opts {
   bool createOnly = false;
   vector<string> models;  // -model: estimate the factor time with computation models
   bool fastOnly = false;  // -fastOnly: with -model, skip the exact analysis
+  bool exactOnly = false;  // -exactOnly: with -model, skip the fast analysis
   string cm;              // -cm: computation model of the analysis in factor runs
   string analysis;        // -analysis exact|fast (default: auto)
   string collect;         // -collect file: append the timings of the factor operations
@@ -607,9 +608,9 @@ static void runModels(const Problem& p, const Opts& o) {
     const ComputationModel* model = namedModel(m);
     printf("%-28s model=%-5s", p.name.c_str(), m.c_str());
     for (bool fast : {false, true}) {
-      if (!fast && o.fastOnly) {
-        printf(" exact: analysis=%9.4fs factor(model)=%9.4fs sparse(model)=%9.4fs nnzL=0 lumps=0 |",
-               0.0, 0.0, 0.0);
+      if ((!fast && o.fastOnly) || (fast && o.exactOnly)) {
+        printf(" %s: analysis=%9.4fs factor(model)=%9.4fs sparse(model)=%9.4fs nnzL=0 lumps=0 |",
+               fast ? "fast" : "exact", 0.0, 0.0, 0.0);
         continue;
       }
       Settings settings;
@@ -817,6 +818,7 @@ static int run(int argc, char* argv[]) {
     else if (a == "-grid3d") gridN = stoi(next()), gridBs = stoi(next());
     else if (a == "-gen") genSpec = next();
     else if (a == "-fastOnly") o.fastOnly = true;
+    else if (a == "-exactOnly") o.exactOnly = true;
     else if (a == "-cm") o.cm = next();
     else if (a == "-analysis") o.analysis = next();
     else if (a == "-collect") o.collect = next();

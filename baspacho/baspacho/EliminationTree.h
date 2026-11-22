@@ -70,6 +70,9 @@ struct EliminationTree {
   // (computeMerges) and by the exact cost (MergeOptimizer)
   void debugMergeEstimates();
 
+  // (research) span-level partition of computeMergesFast (fundamental: only fill-free merges)
+  std::vector<int64_t> partitionFast(bool fundamental);
+
   // internal (called by processTree)
   void collapseMergePointers();
 
