@@ -63,6 +63,11 @@ struct MergeOptimizer {
 
   double colCost(int64_t c, double n) const;
 
+  // assembly of a board: br/bc blocks, m rows (mFull from the board to the end of the column)
+  double asmbl(double br, double bc, double m, double mFull) const {
+    return model.asmblEst(br, bc) + model.asmblElemEst(m, mFull);
+  }
+
   // set by evaluate: per operation (potrf, trsm, syge, asmbl) time and number of calls
   double opTime[4] = {0, 0, 0, 0};
   int64_t opCount[4] = {0, 0, 0, 0};

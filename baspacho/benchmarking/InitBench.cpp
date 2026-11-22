@@ -478,7 +478,8 @@ static pair<double, double> modelledFactorTime(const Solver& solver,
   return {e.supernodal, e.sparse};
 }
 
-// a model by name, or "file:path" with the 20 parameters (potrf 4, trsm 6, syge 6, asmbl 4)
+// a model by name, or "file:path" with the 20 parameters (potrf 4, trsm 6, syge 6, asmbl 4),
+// optionally followed by the per-element asmbl parameter
 static const ComputationModel* namedModel(const string& name) {
   static map<string, unique_ptr<ComputationModel>> fromFiles;
   if (name.rfind("file:", 0) == 0) {
@@ -488,11 +489,14 @@ static const ComputationModel* namedModel(const string& name) {
       vector<double> v;
       double x;
       while (in >> x) v.push_back(x);
-      if (v.size() != 20) throw runtime_error("model file " + name + ": expected 20 numbers");
+      if (v.size() != 20 && v.size() != 21) {
+        throw runtime_error("model file " + name + ": expected 20 or 21 numbers");
+      }
       m.reset(new ComputationModel(Eigen::Vector4d(v[0], v[1], v[2], v[3]),
                                    Eigen::Map<Eigen::Matrix<double, 6, 1>>(&v[4]),
                                    Eigen::Map<Eigen::Matrix<double, 6, 1>>(&v[10]),
-                                   Eigen::Vector4d(v[16], v[17], v[18], v[19])));
+                                   Eigen::Vector4d(v[16], v[17], v[18], v[19]),
+                                   v.size() > 20 ? v[20] : 0.0));
     }
     return m.get();
   }

@@ -24,11 +24,12 @@ struct ComputationModel {
   ComputationModel(const Eigen::Vector<double, 4>& potrfParams_,
                    const Eigen::Vector<double, 6>& trsmParams_,
                    const Eigen::Vector<double, 6>& sygeParams_,
-                   const Eigen::Vector<double, 4>& asmblParams_)
+                   const Eigen::Vector<double, 4>& asmblParams_, double asmblElemParam_ = 0)
       : potrfParams(potrfParams_),
         trsmParams(trsmParams_),
         sygeParams(sygeParams_),
-        asmblParams(asmblParams_) {}
+        asmblParams(asmblParams_),
+        asmblElemParam(asmblElemParam_) {}
 
   // estimate timings of a `potrf` operation
   double potrfEst(double n) const { return potrfModel(potrfParams, n); }
@@ -42,6 +43,12 @@ struct ComputationModel {
   // estimate timings of a `asmbl` operations
   double asmblEst(double br, double bc) const { return asmblModel(asmblParams, br, bc); }
 
+  // per-element part of an `asmbl`, adding the m x mFull rectangle of the syrk/gemm result (rows
+  // of the target lump, by rows from it to the end of the column) to the factor: the `asmbl`
+  // model only depends on the numbers of blocks, which lets large boards look free (0 in the
+  // models fitted before it was introduced)
+  double asmblElemEst(double m, double mFull) const { return asmblElemParam * m * mFull; }
+
   // linear mode of `syrk/gemm` operation timing (depending on node size)
   Eigen::Vector2d sygeLinEst(double m, double n) const { return sygeLinModel(sygeParams, m, n); }
 
@@ -52,6 +59,7 @@ struct ComputationModel {
   Eigen::Vector<double, 6> trsmParams;
   Eigen::Vector<double, 6> sygeParams;
   Eigen::Vector<double, 4> asmblParams;
+  double asmblElemParam = 0;
 
   // `potrf` model: t ~= a + b*n + c*n^2 + d*n^3
   static double potrfModel(const Eigen::Vector<double, 4>& p, double n) {

@@ -40,7 +40,7 @@ MergeOptimizer::MergeOptimizer(const ComputationModel& model, vector<int64_t> pa
       BASPACHO_CHECK_GT(b.c, c);
       perRow[b.c].push_back(Board{(int32_t)c, b.bc, b.m, b.brDown, b.rowsDown});
       colSyge[c] += model.sygeLinEst(b.m, b.m + b.rowsDown);
-      colAsmbl[c] += model.asmblEst(b.bc + b.brDown, b.bc);
+      colAsmbl[c] += asmbl(b.bc + b.brDown, b.bc, b.m, b.m + b.rowsDown);
     }
     total += colCost(c, size[c]);
   }
@@ -81,12 +81,13 @@ double MergeOptimizer::mergeDelta(int64_t k, int64_t p) {
         const Board& e1 = kB[ik];
         const Board& e2 = pB[ip];
         double n = size[c];
-        delta += model.sygeEst(e1.m + e2.m, e1.m + e2.m + e2.rowsDown, n) +
-                 model.asmblEst(e1.bc + e2.bc + e2.brDown, e1.bc + e2.bc) -
+        double m = e1.m + e2.m, bc = e1.bc + e2.bc;
+        delta += model.sygeEst(m, m + e2.rowsDown, n) +
+                 asmbl(bc + e2.brDown, bc, m, m + e2.rowsDown) -
                  model.sygeEst(e1.m, e1.m + e1.rowsDown, n) -
-                 model.asmblEst(e1.bc + e1.brDown, e1.bc) -
+                 asmbl(e1.bc + e1.brDown, e1.bc, e1.m, e1.m + e1.rowsDown) -
                  model.sygeEst(e2.m, e2.m + e2.rowsDown, n) -
-                 model.asmblEst(e2.bc + e2.brDown, e2.bc);
+                 asmbl(e2.bc + e2.brDown, e2.bc, e2.m, e2.m + e2.rowsDown);
       }
       ik++;
       ip++;
@@ -128,9 +129,9 @@ void MergeOptimizer::applyMerge(int64_t k, int64_t p) {
         colSyge[c] += model.sygeLinEst(m.m, m.m + m.rowsDown) -
                       model.sygeLinEst(e1.m, e1.m + e1.rowsDown) -
                       model.sygeLinEst(e2.m, e2.m + e2.rowsDown);
-        colAsmbl[c] += model.asmblEst(m.bc + m.brDown, m.bc) -
-                       model.asmblEst(e1.bc + e1.brDown, e1.bc) -
-                       model.asmblEst(e2.bc + e2.brDown, e2.bc);
+        colAsmbl[c] += asmbl(m.bc + m.brDown, m.bc, m.m, m.m + m.rowsDown) -
+                       asmbl(e1.bc + e1.brDown, e1.bc, e1.m, e1.m + e1.rowsDown) -
+                       asmbl(e2.bc + e2.brDown, e2.bc, e2.m, e2.m + e2.rowsDown);
         tmp.push_back(m);
       }
       ik++;
@@ -238,9 +239,9 @@ double MergeOptimizer::evaluate(const vector<vector<Board>>& colBoards) {
         j++;
       }
       t += model.sygeEst(m, m + bs[j - 1].rowsDown, n) +
-           model.asmblEst(bc + bs[j - 1].brDown, bc);
+           asmbl(bc + bs[j - 1].brDown, bc, m, m + bs[j - 1].rowsDown);
       opTime[2] += model.sygeEst(m, m + bs[j - 1].rowsDown, n);
-      opTime[3] += model.asmblEst(bc + bs[j - 1].brDown, bc);
+      opTime[3] += asmbl(bc + bs[j - 1].brDown, bc, m, m + bs[j - 1].rowsDown);
       opCount[2]++;
       opCount[3]++;
       i = j;
