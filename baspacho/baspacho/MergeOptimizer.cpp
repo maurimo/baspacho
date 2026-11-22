@@ -8,6 +8,7 @@
 #include "baspacho/baspacho/MergeOptimizer.h"
 #include <algorithm>
 #include <queue>
+#include <random>
 #include <tuple>
 #include "baspacho/baspacho/DebugMacros.h"
 
@@ -206,7 +207,9 @@ void MergeOptimizer::bestFirst(int passes) {
   greedy(passes);
 }
 
-void MergeOptimizer::steepest() {
+void MergeOptimizer::steepest(double noise, uint64_t seed) {
+  std::mt19937_64 gen(seed);
+  std::uniform_real_distribution<double> unif(-1.0, 1.0);
   // children lumps of each lump
   vector<vector<int64_t>> kids(numNodes);
   auto isCandidate = [&](int64_t k) {
@@ -220,9 +223,10 @@ void MergeOptimizer::steepest() {
   // (-delta, k, version of k's entry): stale entries are skipped
   vector<int64_t> version(numNodes, 0);
   priority_queue<tuple<double, int64_t, int64_t>> heap;
+  auto rank = [&](double d) { return noise > 0 ? d * (1.0 + noise * unif(gen)) : d; };
   auto push = [&](int64_t k) {
     if (isCandidate(k)) {
-      heap.emplace(-mergeDelta(k, root(parent[k])), k, ++version[k]);
+      heap.emplace(-rank(mergeDelta(k, root(parent[k]))), k, ++version[k]);
     }
   };
   auto refreshAll = [&]() {
@@ -247,12 +251,13 @@ void MergeOptimizer::steepest() {
     }
     int64_t p = root(parent[k]);
     double d = mergeDelta(k, p);
-    if (!heap.empty() && -d < get<0>(heap.top())) {
-      heap.emplace(-d, k, ++version[k]);  // no longer the best
+    double r = rank(d);
+    if (!heap.empty() && -r < get<0>(heap.top())) {
+      heap.emplace(-r, k, ++version[k]);  // no longer the best
       continue;
     }
     if (d >= 0) {
-      heap.emplace(-d, k, ++version[k]);
+      heap.emplace(-r, k, ++version[k]);
       continue;  // (the refresh above decides when to stop)
     }
     applyMerge(k, p);

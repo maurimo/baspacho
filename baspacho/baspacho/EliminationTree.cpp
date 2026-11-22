@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <queue>
+#include <random>
 #include <string>
 #include <tuple>
 #include "baspacho/baspacho/ComputationModel.h"
@@ -692,6 +693,58 @@ void EliminationTree::computeMergesOpt(const std::string& mode, const std::strin
     opt.bestFirst(passes);
   } else if (mode == "steep") {
     opt.steepest();
+  } else if (mode == "deep") {
+    // iterated local search: dissolve a random fraction of the merged lumps, re-merge with a
+    // randomized steepest descent then a plain one, keep if better
+    int iters = getenv("BASPACHO_DEEP_ITERS") ? atoi(getenv("BASPACHO_DEEP_ITERS")) : 10;
+    double frac = getenv("BASPACHO_DEEP_FRAC") ? atof(getenv("BASPACHO_DEEP_FRAC")) : 0.2;
+    double noise = getenv("BASPACHO_DEEP_NOISE") ? atof(getenv("BASPACHO_DEEP_NOISE")) : 0.5;
+    opt.steepest();
+    vector<int64_t> best(numCoarse);
+    for (int64_t a = 0; a < numCoarse; a++) {
+      best[a] = opt.root(a);
+    }
+    double bestCost = opt.total;
+    std::mt19937_64 gen(17);
+    std::uniform_real_distribution<double> unif(0.0, 1.0);
+    for (int it = 0; it < iters; it++) {
+      vector<bool> dissolve(numCoarse, false);
+      for (int64_t a = 0; a < numCoarse; a++) {
+        if (best[a] == a) {
+          dissolve[a] = unif(gen) < frac;
+        }
+      }
+      MergeOptimizer trial(compMod, in.parent, in.size, in.spans, in.rows, in.canMerge,
+                           in.sparse, in.colBoards);
+      for (int64_t k = numCoarse - 1; k >= 0; k--) {
+        if (best[k] != k && !dissolve[best[k]]) {
+          trial.applyMerge(k, trial.root(in.parent[k]));
+        }
+      }
+      trial.steepest(noise, it + 1);
+      trial.steepest();
+      if (getenv("BASPACHO_MERGE_DEBUG")) {
+        fprintf(stderr, "DEEP iter %d: %.6g (best %.6g)\n", it, trial.total, bestCost);
+      }
+      if (trial.total < bestCost) {
+        bestCost = trial.total;
+        for (int64_t a = 0; a < numCoarse; a++) {
+          best[a] = trial.root(a);
+        }
+      }
+    }
+    // final state in `opt`
+    MergeOptimizer fin(compMod, in.parent, in.size, in.spans, in.rows, in.canMerge, in.sparse,
+                       in.colBoards);
+    for (int64_t k = numCoarse - 1; k >= 0; k--) {
+      if (best[k] != k) {
+        fin.applyMerge(k, fin.root(in.parent[k]));
+      }
+    }
+    std::swap(opt.mergeWith, fin.mergeWith);
+    std::swap(opt.size, fin.size);
+    opt.total = fin.total;
+    opt.numMerges = fin.numMerges;
   } else {
     BASPACHO_CHECK(mode == "coarse");  // no merges after the coarse partition
   }
