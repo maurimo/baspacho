@@ -218,7 +218,7 @@ SparseStructure SparseStructure::addIndependentEliminationFill(int64_t elimStart
     fillPtr.assign(numRows0 + 1, 0);
     for (int64_t c = 0; c < numElim; c++) {
       for (int64_t b = elimPtrs[c] + 1; b < elimPtrs[c + 1]; b++) {
-        fillPtr[elimRows[b] - elimEnd + 1] += b - elimPtrs[c];  // all the rows before it
+        fillPtr[elimRows[b] - elimEnd] += b - elimPtrs[c];  // all the rows before it
       }
     }
     cumSumVec(fillPtr);
