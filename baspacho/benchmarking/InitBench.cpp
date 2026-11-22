@@ -25,6 +25,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <memory>
 #include <typeindex>
 #include <unordered_map>
 #include "baspacho/baspacho/ComputationModel.h"
@@ -441,6 +442,9 @@ struct Opts {
   bool createOnly = false;
   vector<string> models;  // -model: estimate the factor time with computation models
   bool fastOnly = false;  // -fastOnly: with -model, skip the exact analysis
+  string cm;              // -cm: computation model of the analysis in factor runs
+  string analysis;        // -analysis exact|fast (default: auto)
+  string collect;         // -collect file: append the timings of the factor operations
 };
 
 static uint64_t hashVec(uint64_t h, const vector<int64_t>& v) {
@@ -573,7 +577,24 @@ static pair<double, double> modelledFactorTime(const Solver& solver,
   return {time, sparseTime};
 }
 
+// a model by name, or "file:path" with the 20 parameters (potrf 4, trsm 6, syge 6, asmbl 4)
 static const ComputationModel* namedModel(const string& name) {
+  static map<string, unique_ptr<ComputationModel>> fromFiles;
+  if (name.rfind("file:", 0) == 0) {
+    auto& m = fromFiles[name];
+    if (!m) {
+      ifstream in(name.substr(5));
+      vector<double> v;
+      double x;
+      while (in >> x) v.push_back(x);
+      if (v.size() != 20) throw runtime_error("model file " + name + ": expected 20 numbers");
+      m.reset(new ComputationModel(Eigen::Vector4d(v[0], v[1], v[2], v[3]),
+                                   Eigen::Map<Eigen::Matrix<double, 6, 1>>(&v[4]),
+                                   Eigen::Map<Eigen::Matrix<double, 6, 1>>(&v[10]),
+                                   Eigen::Vector4d(v[16], v[17], v[18], v[19])));
+    }
+    return m.get();
+  }
   if (name == "cpu") return &ComputationModel::model_OpenBlas_i7_1185g7;
   if (name == "cuda") return &ComputationModel::model_Cuda117_2080Ti;
   if (name == "metal") return &ComputationModel::model_Metal_CI_paravirtual;
@@ -638,6 +659,9 @@ static bool runBackend(const Problem& p, const Opts& o, BackendType backend, con
   settings.backend = backend;
   settings.numThreads = o.numThreads;
   settings.findSparseEliminationRanges = o.autoElim;
+  if (!o.cm.empty()) settings.computationModel = namedModel(o.cm);
+  if (o.analysis == "exact") settings.analysis = AnalysisExact;
+  if (o.analysis == "fast") settings.analysis = AnalysisFast;
   vector<int64_t> elimRanges;
   if (o.givenElim && p.numElim > 0) elimRanges = {0, p.numElim};
 
@@ -672,7 +696,25 @@ static bool runBackend(const Problem& p, const Opts& o, BackendType backend, con
 
   vector<double> tFactor, tSolve;
   vector<double> factored;
+  FILE* collect = nullptr;
+  if (!o.collect.empty()) {
+    collect = fopen(o.collect.c_str(), "a");
+    auto& sym = solver->internalSymbolicContext();
+    sym.potrfStat.callBack = [=](double t, int, int n) {
+      fprintf(collect, "potrf %d %.9g\n", n, t);
+    };
+    sym.trsmStat.callBack = [=](double t, int, int n, int k) {
+      fprintf(collect, "trsm %d %d %.9g\n", n, k, t);
+    };
+    sym.sygeStat.callBack = [=](double t, int, int m, int n, int k) {
+      fprintf(collect, "syge %d %d %d %.9g\n", m, n, k, t);
+    };
+    sym.asmblStat.callBack = [=](double t, int, int br, int bc) {
+      fprintf(collect, "asmbl %d %d %.9g\n", br, bc, t);
+    };
+  }
   for (int r = 0; r < o.reps + 1; r++) {
+    solver->enableStats(collect && r > 0);
     vector<double> work = data;
     x = b;
     double tf, ts;
@@ -709,7 +751,16 @@ static bool runBackend(const Problem& p, const Opts& o, BackendType backend, con
     nrm += xTrue[i] * xTrue[i];
   }
   double relErr = sqrt(err / nrm);
+  if (collect) {
+    solver->enableStats(false);
+    fclose(collect);
+  }
   double createWarm = minOf(vector<double>(tCreate.begin() + 1, tCreate.end()));
+  if (!o.cm.empty()) {
+    auto [tm, ts] = modelledFactorTime(*solver, *namedModel(o.cm));
+    printf("%-28s %-8s model(%s): factor=%9.4fs sparse=%9.4fs\n", p.name.c_str(), label.c_str(),
+           o.cm.c_str(), tm, ts);
+  }
   printf(
       "%-28s %-8s create(cold)=%9.4fs create=%9.4fs factor=%9.4fs solve=%9.4fs "
       "create/factor=%6.2f nnzL=%lld lumps=%lld elimRanges=%zu relErr=%.1e skelHash=%016llx "
@@ -741,7 +792,10 @@ static void help() {
        << "  -grid3d n bs  synthetic n^3 grid, block size bs, 27-point stencil\n"
        << "  -gen spec     synthetic problem, see makeGenerated (eg. knn3d:20000:8:3)\n"
        << "  -model list   only analysis, factor time estimated by the computation models in the\n"
-       << "                comma separated list (cpu, cuda), exact and fast analysis\n"
+       << "                comma separated list (cpu, cuda, metal, file:path), exact and fast\n"
+       << "  -cm name      computation model of the analysis in factor runs (and its estimate)\n"
+       << "  -analysis a   exact or fast (default auto)\n"
+       << "  -collect f    append the timings of the factor operations to f\n"
        << "  -maxbs n      max detected block size for -mtx (default 16)\n";
 }
 
@@ -763,6 +817,9 @@ static int run(int argc, char* argv[]) {
     else if (a == "-grid3d") gridN = stoi(next()), gridBs = stoi(next());
     else if (a == "-gen") genSpec = next();
     else if (a == "-fastOnly") o.fastOnly = true;
+    else if (a == "-cm") o.cm = next();
+    else if (a == "-analysis") o.analysis = next();
+    else if (a == "-collect") o.collect = next();
     else if (a == "-model") {
       stringstream ms(next());
       string m;
