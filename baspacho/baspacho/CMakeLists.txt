@@ -127,6 +127,13 @@ if(HAVE_SUITESPARSE_AMD)
                           ${SUITESPARSE_AMD_LIBRARIES})
 endif()
 
+# experiments: alternative orderings from CHOLMOD (BASPACHO_ORDER=ssamd|metis|nesdis)
+if(BASPACHO_EXPERIMENT_CHOLMOD_ORDERING)
+    target_link_libraries(${BASPACHO_LIBRARY} ${CHOLMOD_LIBRARIES})
+    target_include_directories(${BASPACHO_LIBRARY} PRIVATE ${CHOLMOD_INCLUDE_DIR})
+    target_compile_definitions(${BASPACHO_LIBRARY} PRIVATE BASPACHO_CHOLMOD_ORDERING)
+endif()
+
 if(NOT BUILD_SHARED_LIBS)
     bundle_static_library(${BASPACHO_LIBRARY} BaSpaCho)
 endif()
