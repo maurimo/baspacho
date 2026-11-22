@@ -143,6 +143,14 @@ static void checkDispatches(const CoalescedBlockMatrixSkel& skel, int64_t begin,
                     EXPECT_LE(d.threads, 256);
                     EXPECT_GT(d.groupsX, 0);
                     EXPECT_GT(d.groupsY, 0);
+                    if (d.kernel == MetalLevelKernel::Update && p.useList && !transpose) {
+                      // only levels where some lump has sources in [begin, end) are updated
+                      bool needed = false;
+                      for (int64_t g = 0; g < d.groupsX; g++) {
+                        needed |= lv.lastSource[lv.lumps[p.listOff + g]] >= begin;
+                      }
+                      EXPECT_TRUE(needed);
+                    }
                     for (int64_t g = 0; g < d.groupsX; g++) {
                       int64_t l = p.useList ? lv.lumps[p.listOff + g] : p.listOff + g;
                       ASSERT_GE(l, 0);

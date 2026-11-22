@@ -89,20 +89,26 @@ struct MetalRowChains {
 struct MetalSolveLevels {
   std::vector<int64_t> levelPtr;  // with end
   std::vector<int64_t> lumps;     // the lumps of the levels, sorted within each level
+  // forward: the last lump l < t with blocks in row t, per lump t (-1 if none): the update of t
+  // in a solve of the lumps from `begin` on is needed only if lastSource[t] >= begin
+  std::vector<int64_t> lastSource;
 
   // Solve with L: lump t depends on the lumps l in [begin, t) having blocks in row t
   static MetalSolveLevels forward(const CoalescedBlockMatrixSkel& skel, int64_t begin) {
     const int64_t numLumps = skel.numLumps();
-    std::vector<int64_t> level(numLumps, 0);
+    std::vector<int64_t> level(numLumps, 0), lastSource(numLumps, -1);
     for (int64_t l = begin; l < numLumps; l++) {  // level[l] is final when reached
       for (int64_t c = skel.chainColPtr[l]; c < skel.chainColPtr[l + 1]; c++) {
         int64_t t = skel.spanToLump[skel.chainRowSpan[c]];
         if (t > l) {
           level[t] = std::max(level[t], level[l] + 1);
+          lastSource[t] = l;  // l increasing
         }
       }
     }
-    return fromLevels(level, begin);
+    MetalSolveLevels retv = fromLevels(level, begin);
+    retv.lastSource = std::move(lastSource);
+    return retv;
   }
 
   // Solve with L^T: lump l depends on the lumps t > l having blocks in column l
@@ -224,15 +230,18 @@ void metalLevelSolve(const CoalescedBlockMatrixSkel& skel, const MetalSolveLevel
       continue;
     }
     int64_t maxSize = 0, maxSmallSize = 0;
+    bool needUpdate = false;  // solve with L^T: lumps in level > 0 have blocks below them
     for (int64_t i = a; i < b; i++) {
-      int64_t n = lumpSize(levels.lumps[i]);
+      int64_t l = levels.lumps[i];
+      needUpdate |= transpose ? lv > 0 : levels.lastSource[l] >= lumpsBegin;
+      int64_t n = lumpSize(l);
       maxSize = std::max(maxSize, n);
       if (n <= maxDiag) {
         maxSmallSize = std::max(maxSmallSize, n);
       }
     }
     p.listOff = a;
-    if (lv > 0) {  // lumps in level 0 have no update (nothing before them / below them)
+    if (needUpdate) {  // eg. the lumps of the first levels, or only fed by lumps < lumpsBegin
       update(b - a, maxSize);
     }
     if (maxSmallSize > 0) {
