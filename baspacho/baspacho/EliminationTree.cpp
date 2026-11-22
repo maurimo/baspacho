@@ -674,21 +674,25 @@ vector<int64_t> EliminationTree::partitionFast(bool fundamental, double fundamen
 // must be splittable). Insensitive between 32 and 128 in the experiments
 static constexpr double kFundamentalCap = 32;
 
-void EliminationTree::computeMergesOptimized(bool deep) {
+void EliminationTree::computeMergesOptimized(MergeMode mode) {
   int64_t ord = ss.order();
+  bool greedyCorrected = mode == MergeGreedyCorrected;
+  bool deep = mode == MergeDeep || greedyCorrected;  // (span-level nodes)
 
   // starting partitions (span level); the nodes of the optimization are the intersection of the
   // partitions (connected subtrees: their intersections are connected), single spans for deep
   vector<vector<int64_t>> starts;
-  if (deep && !fastSymbolic) {
+  if (deep && !fastSymbolic && !greedyCorrected) {
     nodeSize = paramSize;
     computeMerges();  // (uses the structure of buildTree, first)
     starts.push_back(currentPartition(*this));
     nodeSize = paramSize;
   }
-  starts.push_back(partitionFast(true, deep ? 1e30 : kFundamentalCap));
-  starts.push_back(partitionFast(false, 0));
-  if (deep) {
+  if (!greedyCorrected) {
+    starts.push_back(partitionFast(true, deep ? 1e30 : kFundamentalCap));
+    starts.push_back(partitionFast(false, 0));
+  }
+  if (deep && !greedyCorrected) {
     starts.push_back(partitionFast(true, kFundamentalCap));
   }
   vector<int64_t> coarseOf(ord);
@@ -743,7 +747,11 @@ void EliminationTree::computeMergesOptimized(bool deep) {
   for (auto& st : starts) {
     MergeOptimizer o = newOpt();
     replay(o, st);
-    o.steepest();
+    if (greedyCorrected) {
+      o.greedy(1);
+    } else {
+      o.steepest();
+    }
     if (first || o.total < bestCost) {
       first = false;
       bestCost = o.total;
@@ -757,7 +765,7 @@ void EliminationTree::computeMergesOptimized(bool deep) {
   // experiments, ie. the steepest descent from the best start is close to a local optimum)
   std::mt19937_64 gen(17);
   std::uniform_real_distribution<double> unif(0.0, 1.0);
-  for (int it = 0; deep && it < deepIterations; it++) {
+  for (int it = 0; mode == MergeDeep && it < deepIterations; it++) {
     vector<bool> dissolve(numCoarse, false);
     for (int64_t a = 0; a < numCoarse; a++) {
       if (best[a] == a) dissolve[a] = unif(gen) < 0.2;
@@ -836,7 +844,7 @@ void EliminationTree::processTree(bool detectSparseElimRanges, const vector<int6
       BASPACHO_CHECK(!fastSymbolic);  // needs buildTree
       computeMerges();
     } else {
-      computeMergesOptimized(mode == MergeDeep);
+      computeMergesOptimized(mode);
     }
     collapseMergePointers();
   }

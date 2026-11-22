@@ -142,6 +142,38 @@ void MergeOptimizer::applyMerge(int64_t k, int64_t p) {
   kB = vector<Board>();
 }
 
+void MergeOptimizer::greedy(int passes) {
+  auto pickUpScore = [&](int64_t k, int64_t p) -> double {
+    return ((double)rows[k]) / (rows[p] + size[p]);
+  };
+  for (int pass = 0; pass < passes; pass++) {
+    int64_t mergesBefore = numMerges;
+    priority_queue<tuple<double, int64_t, int64_t>> candidates;
+    for (int64_t k = numNodes - 1; k >= 0; k--) {
+      if (mergeWith[k] != -1 || !canMerge[k] || sparse[k] || parent[k] == -1) {
+        continue;
+      }
+      int64_t p = root(parent[k]);
+      candidates.emplace(pickUpScore(k, p), k, p);
+    }
+    while (!candidates.empty()) {
+      auto [score, k, p] = candidates.top();
+      candidates.pop();
+      int64_t rp = root(p);
+      if (rp != p) {
+        candidates.emplace(pickUpScore(k, rp), k, rp);
+        continue;
+      }
+      if (mergeDelta(k, p) < 0) {
+        applyMerge(k, p);
+      }
+    }
+    if (numMerges == mergesBefore) {
+      break;
+    }
+  }
+}
+
 void MergeOptimizer::steepest(double noise, uint64_t seed) {
   std::mt19937_64 gen(seed);
   std::uniform_real_distribution<double> unif(-1.0, 1.0);

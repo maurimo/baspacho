@@ -51,6 +51,11 @@ struct MergeOptimizer {
 
   void applyMerge(int64_t k, int64_t p);
 
+  // (for comparison) the merge order of the previous analysis (child rows / parent rows,
+  // decreasing), merging when the time decreases; with `passes` > 1, the candidates are
+  // reconsidered until no merge is accepted (or the number of passes is reached)
+  void greedy(int passes);
+
   // steepest descent: always applies the merge with the best (most negative) time change, the
   // values being re-evaluated when popped, after the lump or the parent's lump changed, and all
   // of them before stopping

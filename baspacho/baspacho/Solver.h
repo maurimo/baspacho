@@ -233,6 +233,7 @@ enum AnalysisMode {
   AnalysisFast,   // column counts, small supernodes, merges optimized with the computation model
   AnalysisExact,  // (previous analysis) full structure of the factor, greedy merges
   AnalysisDeep,   // slower, optimizing the merges from several starting points
+  AnalysisExactCorrected,  // (for comparison) Exact's greedy procedure with the exact cost
 };
 
 struct Settings {

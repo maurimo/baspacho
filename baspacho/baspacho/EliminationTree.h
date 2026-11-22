@@ -66,7 +66,15 @@ struct EliminationTree {
   // how the merges are chosen by processTree. Auto: Optimized after buildTreeFast, Greedy after
   // buildTree. Relaxed: relaxed amalgamation (computeMergesFast). Greedy: computeMerges, greedy
   // on an estimate of the merge's effect on the two nodes. Optimized/Deep: computeMergesOptimized
-  enum MergeMode { MergeAuto, MergeRelaxed, MergeGreedy, MergeOptimized, MergeDeep };
+  // GreedyCorrected (for comparison): computeMerges' greedy procedure with the exact cost
+  enum MergeMode {
+    MergeAuto,
+    MergeRelaxed,
+    MergeGreedy,
+    MergeOptimized,
+    MergeDeep,
+    MergeGreedyCorrected
+  };
   MergeMode mergeMode = MergeAuto;
   int deepIterations = 0;     // MergeDeep: rounds of iterated local search
   double optimizedCost = -1;  // set by computeMergesOptimized: estimated time of the factor
@@ -75,7 +83,7 @@ struct EliminationTree {
   // the operations (MergeOptimizer, steepest descent): from the (capped) fundamental and the
   // relaxed supernodes, or (deep) on single spans from more starting points (including the result
   // of computeMerges after buildTree) followed by `deepIterations` rounds of local search
-  void computeMergesOptimized(bool deep);
+  void computeMergesOptimized(MergeMode mode);
 
   // span-level partition of computeMergesFast (fundamental: only fill-free merges, up to a size)
   std::vector<int64_t> partitionFast(bool fundamental, double fundamentalCap);
