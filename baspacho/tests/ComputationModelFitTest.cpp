@@ -30,12 +30,15 @@ const ComputationModel kTrue(
 // samples of `kTrue` with multiplicative noise and a few outliers (descheduled process)
 ComputationModelSamples syntheticSamples() {
   mt19937 gen(7);
-  uniform_int_distribution<int> sz(1, 400);
+  // sizes log-uniform in [1, 400] (as in factorizations: many small operations, a few large)
+  uniform_real_distribution<double> logSz(0.0, log(400.0));
+  auto sz = [&](mt19937& g) { return floor(exp(logSz(g))); };
   normal_distribution<double> noise(0.0, 0.05);
   auto t = [&](double est, int i) { return est * exp(noise(gen)) * (i % 97 == 0 ? 20.0 : 1.0); };
   ComputationModelSamples s;
   for (int i = 0; i < 3000; i++) {
-    double m = sz(gen), n = sz(gen), k = sz(gen), br = sz(gen) / 4 + 1, bc = sz(gen) / 8 + 1;
+    double m = sz(gen), n = sz(gen), k = sz(gen), br = floor(sz(gen) / 4) + 1;
+    double bc = floor(sz(gen) / 8) + 1;
     s.potrf.push_back({n, t(kTrue.potrfEst(n), i)});
     s.trsm.push_back({n, k, t(kTrue.trsmEst(n, k), i)});
     s.syge.push_back({m, m + n, k, t(kTrue.sygeEst(m, m + n, k), i)});
@@ -59,10 +62,10 @@ TEST(ComputationModelFit, RecoversModel) {
       EXPECT_LT(stats[i].kept, stats[i].samples);  // (the outliers)
       EXPECT_NEAR(stats[i].totalRatio, 1.0, 0.05);
     }
-    for (double n : {1.0, 10.0, 100.0, 300.0}) {
+    for (double n : {1.0, 10.0, 100.0, 300.0}) {  // (within the range of the samples)
       EXPECT_NEAR(m.potrfEst(n) / kTrue.potrfEst(n), 1.0, 0.05);
-      EXPECT_NEAR(m.trsmEst(n, 2 * n) / kTrue.trsmEst(n, 2 * n), 1.0, 0.05);
-      EXPECT_NEAR(m.sygeEst(n, 3 * n, n) / kTrue.sygeEst(n, 3 * n, n), 1.0, 0.05);
+      EXPECT_NEAR(m.trsmEst(n, n) / kTrue.trsmEst(n, n), 1.0, 0.05);
+      EXPECT_NEAR(m.sygeEst(n, 2 * n, n) / kTrue.sygeEst(n, 2 * n, n), 1.0, 0.05);
     }
     for (double p : {m.potrfParams.minCoeff(), m.trsmParams.minCoeff(), m.sygeParams.minCoeff(),
                      m.asmblParams.minCoeff(), m.asmblElemParam}) {
