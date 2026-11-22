@@ -26,8 +26,8 @@ libraries. It is designed with optimization libraries for Levenberg-Marquardt in
 at reducing part of the complexity offering the best tool for the job.
 Compared to the library currently considered state of the art (CHOLMOD from SuiteSparse) it
 supports:
-* **pure-CUDA mode with support for batching,** ie. solving a batch of matrices with identical
-structure. This is to support differentiable optimization in Theseus library.
+* **GPU acceleration with CUDA and Metal,** supporting NVIDIA GPUs (CUDA) and Apple Silicon
+(Metal). CUDA supports batching for differentiable optimization in Theseus library.
 * **parallel elimination of independent sparse small elimination nodes,** essentially
 the operation done via "Schur-elimination trick" in mathematical optimization libraries such as Ceres.
 This is a workaround to the supernodal algorithm being a bad fit for the problem structure, so the
@@ -50,7 +50,8 @@ Libraries fetched automatical by build:
 * Sophus (only used in BA demo)
 
 Optional libraries:
-* CUDA toolkit (tested with CUDA 10.2/11.7), if not available must explicitly disable GPU support, see below.
+* CUDA toolkit (tested with CUDA 10.2/11.7), for NVIDIA GPU support. Disable with `-DBASPACHO_USE_CUBLAS=0`.
+* Metal (macOS only), for Apple Silicon GPU support. Enable with `-DBASPACHO_USE_METAL=1`.
 * AMD, from SuiteSparse, can be used instead of Eigen for block reordering algorithm.
 * CHOLMOD, from SuiteSparse, used in benchmark as a reference for performance of sparse solvers.
 
@@ -82,16 +83,66 @@ Show tests:
 ctest --test-dir build --show-only
 ```
 
-### Cuda
-Cuda is enabled by default with BASPACHO_USE_CUBLAS option (on by default), add
+### CUDA
+CUDA is enabled by default with BASPACHO_USE_CUBLAS option (on by default), add
 `-DBASPACHO_USE_CUBLAS=0` to disable in build.
 May have to add `-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc` to allow build
 to find the cuda compiler.
-The Cuda architectures can be specified with e.g. `-DBASPACHO_CUDA_ARCHS="60;70;75"`,
+The CUDA architectures can be specified with e.g. `-DBASPACHO_CUDA_ARCHS="60;70;75"`,
 which also supports the options 'detect' (default) which detects the installed GPU arch,
 and 'torch' which fills in the architectures supported by PyTorch and >=60 (see below).
 
-### Blas
+### Metal (Apple Silicon)
+Metal support is available for macOS with Apple Silicon (M1/M2/M3/M4). To enable:
+```
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBASPACHO_USE_CUBLAS=0 -DBASPACHO_USE_METAL=1 -DBLA_VENDOR=Apple
+```
+
+**Important: The Metal backend only supports single-precision (float) operations.**
+Apple Silicon GPUs lack native double-precision FP64 support. Attempting to use
+double precision with the Metal backend will result in a runtime error. For double
+precision, use the CPU backend (`BackendFast`) or CUDA (`BackendCuda`).
+
+All the numeric work runs on the GPU: custom Metal compute kernels (sparse elimination,
+assembly, dense Cholesky, triangular solves) and Metal Performance Shaders for the large dense
+products. The shader library is embedded in the BaSpaCho library. Data is passed in Metal
+buffers, eg. with `MetalMirror`:
+```cpp
+#include "baspacho/baspacho/MetalDefs.h"
+#include "baspacho/baspacho/Solver.h"
+
+Settings settings;
+settings.backend = BackendMetal;
+SolverPtr solver = createSolver(settings, paramSize, structure);
+
+std::vector<float> data(solver->dataSize());  // fill with the matrix (see solver->accessor())
+MetalMirror<float> dataGpu(data);
+solver->factor(dataGpu.ptr());
+std::vector<float> rhs(solver->order());  // fill with the right hand side
+MetalMirror<float> rhsGpu(rhs);
+solver->solve(dataGpu.ptr(), rhsGpu.ptr(), solver->order(), /* nRHS = */ 1);
+rhsGpu.get(rhs);  // waits for the GPU and copies the solution back
+```
+GPU errors are reported by throwing `std::runtime_error` from the solver call.
+
+### Backend Selection
+The backend is chosen explicitly with `Settings::backend` (recommended): it determines the
+scalar types that can be used (Metal: float only) and where the data must live (host memory for
+`BackendFast`/`BackendRef`, CUDA device memory for `BackendCuda`, Metal buffers for
+`BackendMetal`).
+
+`BackendAuto` picks the first backend, in the order CUDA > Metal > CPU (BLAS), that is compiled
+in and has a device available at runtime. Since the data must be allocated accordingly, query
+it first with `detectBestBackend()`:
+```cpp
+BackendType backend = detectBestBackend();  // BackendCuda, BackendMetal or BackendFast
+Settings settings;
+settings.backend = backend;
+SolverPtr solver = createSolver(settings, paramSize, structure);
+// allocate the data for `backend` (eg. MetalMirror<float> for BackendMetal)
+```
+
+### BLAS
 The library used is specified in the CMake variable BLA_VENDOR,
 a few possibilities are:
 * ATLAS
@@ -187,11 +238,13 @@ because matrices naturally have a block-structure depending on parameters of dim
 cuda-kernel operations are designed around blocks so it's not ideal if you have some huge parameter blocks,
 the library will work best when the parameter blocks have sizes 1 to 12 (in a factor graph, generally you
 have many parameter blocks of the same type).
-* About determinism: assuming BLAS is deterministic, BaSpaCho will be 100% deterministic on the CPU, but
+* **CUDA determinism**: assuming BLAS is deterministic, BaSpaCho will be 100% deterministic on the CPU, but
 not on CUDA if there is any "sparse elimination" set of parameters, because both factor and solve operations
-use atomic addition for parallelism on the GPU. Also, a Cuda architecture >=6 is needed for atomicAdd
-on double numbers (this is the compute hardware architecture and not the version of Cuda, arch >=6 means
+use atomic addition for parallelism on the GPU. Also, a CUDA architecture >=6 is needed for atomicAdd
+on double numbers (this is the compute hardware architecture and not the version of CUDA, arch >=6 means
 you need Tesla P100 or GTX 1080-family, or newer. See
-[Cuda Architectures](https://en.wikipedia.org/wiki/CUDA#GPUs_supported)).
+[CUDA Architectures](https://en.wikipedia.org/wiki/CUDA#GPUs_supported)).
 Otherwise you will have to add define `CUDA_DOUBLE_ATOMIC_ADD_WORKAROUND` in order to enable the workaround
 in `CudaAtomic.cuh`.
+* **Metal precision**: The Metal backend only supports single-precision (float) due to Apple Silicon's
+limited FP64 support. Use `BackendFast` (CPU) or `BackendCuda` for double precision requirements.

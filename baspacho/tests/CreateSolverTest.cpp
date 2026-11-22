@@ -154,3 +154,22 @@ TEST(CreateSolver, testCreateSolver_Last_float) { testCreateSolver_Many<float>(f
 TEST(CreateSolver, testCreateSolver_ElimLast_double) { testCreateSolver_Many<double>(true, true); }
 
 TEST(CreateSolver, testCreateSolver_ElimLast_float) { testCreateSolver_Many<float>(true, true); }
+
+// BackendAuto picks a backend which is compiled in and has a device available at runtime (eg.
+// a CUDA build on a machine without GPU falls back to the CPU)
+TEST(CreateSolver, DetectBestBackend) {
+  BackendType backend = detectBestBackend();
+  EXPECT_NE(backend, BackendAuto);
+  EXPECT_NE(backend, BackendRef);
+#ifdef BASPACHO_USE_CUBLAS
+  if (backend != BackendCuda) {
+    EXPECT_FALSE(cudaDeviceAvailable());
+  }
+#endif
+  Settings settings;
+  settings.backend = BackendAuto;
+  SparseStructure ss;
+  ss.ptrs = {0, 1, 3};
+  ss.inds = {0, 0, 1};
+  EXPECT_NO_THROW(createSolver(settings, {2, 3}, ss));
+}

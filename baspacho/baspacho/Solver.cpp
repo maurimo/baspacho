@@ -226,6 +226,7 @@ void Solver::internalFactorRange(T* data, int64_t startSpanIndex, int64_t endSpa
   for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
     if (sparseElimRanges[l + 1] > upToLump) {
       BASPACHO_CHECK_EQ(sparseElimRanges[l], upToLump);
+      numCtx->finish();
       return;
     } else if (startLump > sparseElimRanges[l]) {
       BASPACHO_CHECK_GE(startLump, sparseElimRanges[l + 1]);
@@ -264,6 +265,8 @@ void Solver::internalFactorRange(T* data, int64_t startSpanIndex, int64_t endSpa
       factorLump(*numCtx, data, l);
     }
   }
+
+  numCtx->finish();
 }
 
 template <typename T>
@@ -274,6 +277,7 @@ void Solver::solve(const T* matData, T* vecData, int64_t stride, int nRHS) const
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
   internalSolveLRange(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
   internalSolveLtRange(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
+  slvCtx->finish();
 }
 
 template <typename T>
@@ -300,6 +304,7 @@ void Solver::solveLUpTo(const T* matData, int64_t spanIndex, T* vecData, int64_t
   }
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
   internalSolveLRange(*slvCtx, matData, 0, spanIndex, vecData, stride, nRHS);
+  slvCtx->finish();
 }
 
 template <typename T>
@@ -310,6 +315,7 @@ void Solver::solveLtUpTo(const T* matData, int64_t spanIndex, T* vecData, int64_
   }
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
   internalSolveLtRange(*slvCtx, matData, 0, spanIndex, vecData, stride, nRHS);
+  slvCtx->finish();
 }
 
 template <typename T>
@@ -320,6 +326,7 @@ void Solver::solveLFrom(const T* matData, int64_t spanIndex, T* vecData, int64_t
   }
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
   internalSolveLRange(*slvCtx, matData, spanIndex, factorSkel.numSpans(), vecData, stride, nRHS);
+  slvCtx->finish();
 }
 
 template <typename T>
@@ -330,6 +337,7 @@ void Solver::solveLtFrom(const T* matData, int64_t spanIndex, T* vecData, int64_
   }
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
   internalSolveLtRange(*slvCtx, matData, spanIndex, factorSkel.numSpans(), vecData, stride, nRHS);
+  slvCtx->finish();
 }
 
 static constexpr bool SparseElimSolve = true;
@@ -485,6 +493,7 @@ void Solver::addMvFrom(const T* matData, int64_t spanIndex, const T* inVecData, 
   if (numSpans == upToLump - denseOpsFromLump && slvCtx->hasFragmentedOps() && nRHS == 1) {
     BASPACHO_CHECK_EQ(factorSkel.lumpToSpan[denseOpsFromLump], denseOpsFromLump);
     slvCtx->fragmentedMV(matData, inVecData, denseOpsFromLump, upToLump, outVecData, alpha);
+    slvCtx->finish();
     return;
   }
 
@@ -518,6 +527,8 @@ void Solver::addMvFrom(const T* matData, int64_t spanIndex, const T* inVecData, 
     slvCtx->gemvT(matData, belowDiagOffset, numRowsBelowDiag, lumpSize, outVecData, lumpStart,
                   outStride, alpha);
   }
+
+  slvCtx->finish();
 }
 
 template <typename T>
@@ -527,6 +538,7 @@ void Solver::pseudoFactorFrom(T* data, int64_t spanIndex, bool /* verbose */) co
   }
   NumericCtxPtr<T> numCtx = symCtx->createNumericCtx<T>(maxElimTempSize, data);
   numCtx->pseudoFactorSpans(data, spanIndex, factorSkel.numSpans());
+  numCtx->finish();
 }
 
 template void Solver::factor<double>(double* data, bool verbose) const;
@@ -731,18 +743,48 @@ static void leadingColumnsOfPermuted(const SparseStructure& ss, const vector<int
                          });
 }
 
+BackendType detectBestBackend() {
+  // Priority: CUDA > Metal > Fast (CPU), among the backends compiled in and with a device
+  // available at runtime
+#ifdef BASPACHO_USE_CUBLAS
+  if (cudaDeviceAvailable()) {
+    return BackendCuda;
+  }
+#endif
+#ifdef BASPACHO_USE_METAL
+  if (metalDeviceAvailable()) {
+    return BackendMetal;
+  }
+#endif
+  return BackendFast;
+}
+
 OpsPtr getBackend(const Settings& settings) {
-  if (settings.backend == BackendFast) {
+  BackendType backend = settings.backend;
+
+  // Handle auto-detection
+  if (backend == BackendAuto) {
+    backend = detectBestBackend();
+  }
+
+  if (backend == BackendFast) {
     return fastOps(settings.numThreads);
-  } else if (settings.backend == BackendCuda) {
+  } else if (backend == BackendCuda) {
 #ifdef BASPACHO_USE_CUBLAS
     return cudaOps();
 #else
     std::cerr << "Baspacho: CUDA not enabled at compile time" << std::endl;
     abort();
 #endif
+  } else if (backend == BackendMetal) {
+#ifdef BASPACHO_USE_METAL
+    return metalOps();
+#else
+    std::cerr << "Baspacho: Metal not enabled at compile time" << std::endl;
+    abort();
+#endif
   }
-  BASPACHO_CHECK(settings.backend == BackendRef);
+  BASPACHO_CHECK(backend == BackendRef);
   return simpleOps();
 }
 
