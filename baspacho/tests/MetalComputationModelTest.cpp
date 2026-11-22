@@ -11,8 +11,10 @@
 // command buffer. The operations of the factorization of a few problems are collected, the fixed
 // cost of a command buffer (measured on trivial operations) is subtracted, since in a normal
 // factorization the operations share command buffers, and the parameters of each model are
-// fitted by least squares on the relative errors. The parameters are printed in the format of
-// ComputationModel.cpp, followed by the error of the fit.
+// fitted by non-negative least squares on the relative errors (non-negative coefficients keep
+// the estimates positive and increasing in every size, also outside the range of the samples:
+// the merges chosen by the analysis must not exploit the artifacts of a fit). The parameters are
+// printed in the format of ComputationModel.cpp, followed by the error of the fit.
 
 #include <gtest/gtest.h>
 #include <Eigen/Dense>
@@ -104,9 +106,11 @@ struct Samples {
 };
 
 // factors `prob` on Metal with the stats enabled, collecting the operation timings
-void collect(const Problem& prob, Samples& samples, int reps) {
+void collect(const Problem& prob, Samples& samples, int reps,
+             AnalysisMode analysis = AnalysisAuto) {
   Settings settings;
   settings.backend = BackendMetal;
+  settings.analysis = analysis;
   SolverPtr solver = createSolver(settings, prob.paramSize, prob.ss);
   SymbolicCtx& sym = solver->internalSymbolicContext();
   sym.potrfStat.callBack = [&](double t, int, int n) { samples.potrf.emplace_back(n, t); };
@@ -144,7 +148,59 @@ void collect(const Problem& prob, Samples& samples, int reps) {
   }
 }
 
-// least squares on the relative errors: minimizes sum_i ((f_i . x - t_i) / t_i)^2
+// non-negative least squares (Lawson-Hanson active set): min |A x - b|, x >= 0
+Eigen::VectorXd nnls(const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
+  int64_t n = A.cols();
+  Eigen::VectorXd x = Eigen::VectorXd::Zero(n);
+  vector<bool> passive(n, false);
+  auto lsOnPassive = [&]() {
+    vector<int64_t> idx;
+    for (int64_t j = 0; j < n; j++) {
+      if (passive[j]) idx.push_back(j);
+    }
+    Eigen::MatrixXd Ap(A.rows(), idx.size());
+    for (size_t q = 0; q < idx.size(); q++) Ap.col(q) = A.col(idx[q]);
+    Eigen::VectorXd zp = Ap.colPivHouseholderQr().solve(b);
+    Eigen::VectorXd z = Eigen::VectorXd::Zero(n);
+    for (size_t q = 0; q < idx.size(); q++) z[idx[q]] = zp[q];
+    return z;
+  };
+  for (int iter = 0; iter < 3 * n; iter++) {
+    Eigen::VectorXd w = A.transpose() * (b - A * x);
+    int64_t best = -1;
+    for (int64_t j = 0; j < n; j++) {
+      if (!passive[j] && w[j] > 1e-12 * b.norm() && (best == -1 || w[j] > w[best])) best = j;
+    }
+    if (best == -1) break;
+    passive[best] = true;
+    while (true) {
+      Eigen::VectorXd z = lsOnPassive();
+      bool allPos = true;
+      double alpha = 1.0;
+      for (int64_t j = 0; j < n; j++) {
+        if (passive[j] && z[j] <= 0) {
+          allPos = false;
+          alpha = min(alpha, x[j] / (x[j] - z[j]));
+        }
+      }
+      if (allPos) {
+        x = z;
+        break;
+      }
+      x += alpha * (z - x);
+      for (int64_t j = 0; j < n; j++) {
+        if (passive[j] && x[j] <= 1e-15) {
+          passive[j] = false;
+          x[j] = 0;
+        }
+      }
+    }
+  }
+  return x;
+}
+
+// non-negative least squares on the relative errors: min sum_i ((f_i . x - t_i) / t_i)^2,
+// x >= 0 (columns scaled for the conditioning)
 template <int N>
 Eigen::Matrix<double, N, 1> fitRelative(const vector<Eigen::Matrix<double, N, 1>>& features,
                                         const vector<double>& times) {
@@ -153,7 +209,10 @@ Eigen::Matrix<double, N, 1> fitRelative(const vector<Eigen::Matrix<double, N, 1>
   for (size_t i = 0; i < features.size(); i++) {
     A.row(i) = features[i].transpose() / times[i];
   }
-  return A.colPivHouseholderQr().solve(b);
+  Eigen::VectorXd scale = A.colwise().norm().transpose().cwiseMax(1e-300);
+  for (int j = 0; j < N; j++) A.col(j) /= scale[j];
+  Eigen::VectorXd x = nnls(A, b);
+  return x.cwiseQuotient(scale);
 }
 
 double median(vector<double> v) {
@@ -190,10 +249,15 @@ TEST(MetalComputationModel, Fit) {
   for (auto& [n, t] : trivial.potrf) trivialTimes.push_back(t);
   double overhead = median(trivialTimes);
 
+  // small and large operations: grids with both analyses (the exact one makes large nodes),
+  // a larger grid (large separators), bundle adjustment
   Samples s;
   for (int64_t bs : {1, 2, 3, 6}) {
-    collect(grid3d(bs <= 2 ? 12 : 9, bs), s, 1);
+    for (AnalysisMode an : {AnalysisFast, AnalysisExact}) {
+      collect(grid3d(bs <= 2 ? 12 : 9, bs), s, 1, an);
+    }
   }
+  collect(grid3d(18, 3), s, 1, AnalysisFast);
   collect(ba(80, 2000, 9), s, 1);
   printf("metal model samples: potrf %zu, trsm %zu, syge %zu, asmbl %zu; command buffer "
          "overhead %.1f us\n",
@@ -256,10 +320,26 @@ TEST(MetalComputationModel, Fit) {
   });
   printf("metal model fit, median relative error: potrf %.2f, trsm %.2f, syge %.2f, asmbl %.2f\n",
          ePotrf, eTrsm, eSyge, eAsmbl);
+  double maxN = 0, maxK = 0;
+  for (auto& [mnk, t] : s.syge) {
+    maxN = max(maxN, mnk[1]);
+    maxK = max(maxK, mnk[2]);
+  }
+  printf("metal model samples range: syge n up to %.0f, k up to %.0f; GFlop/s syge(m=n=k): "
+         "128 %.1f, 512 %.1f, 2048 %.1f; potrf: 128 %.1f, 512 %.1f, 2048 %.1f\n",
+         maxN, maxK, 2 * pow(128, 3) / model.sygeEst(128, 128, 128) * 1e-9,
+         2 * pow(512, 3) / model.sygeEst(512, 512, 512) * 1e-9,
+         2 * pow(2048, 3) / model.sygeEst(2048, 2048, 2048) * 1e-9,
+         pow(128, 3) / 3 / model.potrfEst(128) * 1e-9, pow(512, 3) / 3 / model.potrfEst(512) * 1e-9,
+         pow(2048, 3) / 3 / model.potrfEst(2048) * 1e-9);
 
   for (double p : {pPotrf.norm(), pTrsm.norm(), pSyge.norm(), pAsmbl.norm()}) {
     EXPECT_TRUE(std::isfinite(p));
   }
+  EXPECT_GE(pPotrf.minCoeff(), 0.0);
+  EXPECT_GE(pTrsm.minCoeff(), 0.0);
+  EXPECT_GE(pSyge.minCoeff(), 0.0);
+  EXPECT_GE(pAsmbl.minCoeff(), 0.0);
   // loose bounds: the paravirtual GPU of the CI runners is noisy
   EXPECT_LT(ePotrf, 1.0);
   EXPECT_LT(eTrsm, 1.0);
