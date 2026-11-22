@@ -67,6 +67,9 @@ struct EliminationTree {
   // internal (called by processTree)
   void collapseMergePointers();
 
+  // internal: the node `p` was merged into (following mergeWith, with path compression)
+  int64_t mergedRoot(int64_t p);
+
   // init data
   std::vector<int64_t> paramSize;
   const SparseStructure& ss;  // input

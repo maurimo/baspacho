@@ -308,9 +308,7 @@ void EliminationTree::computeMergesFast() {
     auto [score, k, p] = mergeCandidates.top();
     mergeCandidates.pop();
     int64_t oldP = p;
-    while (mergeWith[p] != -1) {
-      p = mergeWith[p];
-    }
+    p = mergedRoot(p);
     if (oldP != p) {  // parent was merged, re-prioritize
       mergeCandidates.emplace(pickUpScore(k, p), k, p);
       continue;
@@ -425,6 +423,22 @@ void EliminationTree::computeSparseElimRanges(const vector<int64_t>& noCrossPoin
   }
 }
 
+// the node a node was merged into (following mergeWith), with path compression
+int64_t EliminationTree::mergedRoot(int64_t p) {
+  int64_t root = p;
+  while (mergeWith[root] != -1) {
+    root = mergeWith[root];
+  }
+  while (p != root) {
+    int64_t next = mergeWith[p];
+    if (next != root) {
+      mergeWith[p] = root;
+    }
+    p = next;
+  }
+  return root;
+}
+
 void EliminationTree::computeMerges() {
   int64_t ord = ss.order();
   numMergedNodes.assign(ord, 1);
@@ -455,11 +469,7 @@ void EliminationTree::computeMerges() {
     mergeCandidates.pop();
 
     auto oldP = p;
-    BASPACHO_CHECK_LT(p, (int64_t)mergeWith.size());
-    while (mergeWith[p] != -1) {
-      p = mergeWith[p];
-      BASPACHO_CHECK_LT(p, (int64_t)mergeWith.size());
-    }
+    p = mergedRoot(p);
 
     // parent was merged? value changed, re-prioritize
     if (oldP != p) {
