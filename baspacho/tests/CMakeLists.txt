@@ -8,8 +8,9 @@ add_baspacho_test(FactorTest FactorTest.cpp)
 add_baspacho_test(SolveTest SolveTest.cpp)
 add_baspacho_test(MathUtilsTest MathUtilsTest.cpp)
 add_baspacho_test(PartialFactorSolveTest PartialFactorSolveTest.cpp)
-# level scheduling of the Metal solves (plain C++, tested everywhere)
-add_baspacho_test(MetalSolveLevelsTest MetalSolveLevelsTest.cpp)
+# level scheduling of the Metal solves (plain C++, tested everywhere; the name must not match
+# "Metal", the Metal CI job selects the device tests with -R Metal)
+add_baspacho_test(SolveLevelsTest SolveLevelsTest.cpp)
 
 if(BASPACHO_USE_CUBLAS)
 add_baspacho_test(CudaFactorTest CudaFactorTest.cpp)

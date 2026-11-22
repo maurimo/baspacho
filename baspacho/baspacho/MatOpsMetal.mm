@@ -127,27 +127,28 @@ struct MetalSymbolicCtx : SymbolicCtx {
 
   virtual SolveCtxBase* createSolveCtxForType(type_index tIdx, int nRHS, int batchSize) override;
 
-  // Levels of the solves of the lumps from `begin` on, and their lists of lumps on the GPU
+  // Levels of the solves (of all the lumps), and their lists of lumps on the GPU. Computed once
+  // from lump 0: a range [begin, end) of lumps is solved with the levels restricted to it, which
+  // still respect the dependencies, so a single schedule serves every partial solve
   struct SolveLevels {
     MetalSolveLevels fwd, bwd;
     MetalMirror<int64_t> devFwdLumps, devBwdLumps;
   };
 
-  // computed on first use (and kept, typically begin is 0, or the start of the dense lumps)
-  const SolveLevels& solveLevels(int64_t begin) {
+  // computed on first use
+  const SolveLevels& solveLevels() {
     std::lock_guard<std::mutex> lock(solveLevelsMutex);
-    std::unique_ptr<SolveLevels>& lv = solveLevelsFrom[begin];
-    if (!lv) {
-      lv = std::make_unique<SolveLevels>();
-      lv->fwd = MetalSolveLevels::forward(skel, begin);
-      lv->bwd = MetalSolveLevels::backward(skel, begin);
-      std::vector<int64_t> fwdLumps = lv->fwd.lumps, bwdLumps = lv->bwd.lumps;
+    if (!levels) {
+      levels = std::make_unique<SolveLevels>();
+      levels->fwd = MetalSolveLevels::forward(skel, 0);
+      levels->bwd = MetalSolveLevels::backward(skel, 0);
+      std::vector<int64_t> fwdLumps = levels->fwd.lumps, bwdLumps = levels->bwd.lumps;
       fwdLumps.push_back(0);  // not empty
       bwdLumps.push_back(0);
-      lv->devFwdLumps.load(fwdLumps);
-      lv->devBwdLumps.load(bwdLumps);
+      levels->devFwdLumps.load(fwdLumps);
+      levels->devBwdLumps.load(bwdLumps);
     }
-    return *lv;
+    return *levels;
   }
 
   const CoalescedBlockMatrixSkel& skel;
@@ -173,7 +174,7 @@ struct MetalSymbolicCtx : SymbolicCtx {
   MetalMirror<int64_t> devRowChainLump;
 
   std::mutex solveLevelsMutex;
-  std::map<int64_t, std::unique_ptr<SolveLevels>> solveLevelsFrom;
+  std::unique_ptr<SolveLevels> levels;
 };
 
 // Metal operations factory
@@ -199,10 +200,18 @@ int64_t metalMpsGemmCount() { return mpsGemmCount.load(); }
 static std::atomic<int64_t> statDispatches{0};
 static std::atomic<int64_t> statCommandBuffers{0};
 static std::atomic<int64_t> statGpuNanoseconds{0};
-MetalSolveOptions& metalSolveOptions() {
-  static MetalSolveOptions options;
-  return options;
+static thread_local const MetalSolveOptions* currentSolveOptions = nullptr;
+
+MetalSolveOptions metalSolveOptions() {
+  return currentSolveOptions ? *currentSolveOptions : MetalSolveOptions{};
 }
+
+MetalSolveOptionsScope::MetalSolveOptionsScope(const MetalSolveOptions& options_)
+    : options(options_), prev(currentSolveOptions) {
+  currentSolveOptions = &options;
+}
+
+MetalSolveOptionsScope::~MetalSolveOptionsScope() { currentSolveOptions = prev; }
 
 MetalStats metalStats() {
   return MetalStats{statDispatches.load(), statCommandBuffers.load(),
@@ -1182,7 +1191,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     if (lumpsBegin >= lumpsEnd || nRHS <= 0) {
       return true;
     }
-    const MetalSymbolicCtx::SolveLevels& lv = sym.solveLevels(lumpsBegin);
+    const MetalSymbolicCtx::SolveLevels& lv = sym.solveLevels();
     MetalBufRef d = findMetalBuf(data, "MetalSolveCtx<float>::levelSolve");
     MetalBufRef c = findMetalBuf(C, "MetalSolveCtx<float>::levelSolve");
     id<MTLBuffer> lumpsBuf =

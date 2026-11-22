@@ -113,10 +113,11 @@ static void checkLevels(const CoalescedBlockMatrixSkel& skel, int64_t begin, boo
 }
 
 // Runs metalLevelSolve recording the dispatches, and checks their order
+// (with the levels computed from lump 0, as in the Metal backend: one schedule for all the ranges)
 static void checkDispatches(const CoalescedBlockMatrixSkel& skel, int64_t begin, int64_t end,
                             bool transpose, int64_t maxDiag) {
-  MetalSolveLevels lv = transpose ? MetalSolveLevels::backward(skel, begin)
-                                  : MetalSolveLevels::forward(skel, begin);
+  MetalSolveLevels lv =
+      transpose ? MetalSolveLevels::backward(skel, 0) : MetalSolveLevels::forward(skel, 0);
   const int64_t numLumps = skel.numLumps();
   auto lumpSize = [&](int64_t l) { return skel.lumpStart[l + 1] - skel.lumpStart[l]; };
   vector<int64_t> solvedAt(numLumps, -1), updatedAt(numLumps, -1);
@@ -222,19 +223,19 @@ static void testSkel(const CoalescedBlockMatrixSkel& skel) {
   }
 }
 
-TEST(MetalSolveLevels, SparseElim) {
+TEST(SolveLevels, SparseElim) {
   for (int i = 0; i < 10; i++) {
     testSkel(*makeSkel(i, true));
   }
 }
 
-TEST(MetalSolveLevels, LargeLumps) {
+TEST(SolveLevels, LargeLumps) {
   for (int i = 0; i < 10; i++) {
     testSkel(*makeSkel(i, false));
   }
 }
 
-TEST(MetalSolveLevels, Fewer_Levels_Than_Lumps) {
+TEST(SolveLevels, Fewer_Levels_Than_Lumps) {
   // the levels are useful only if there are many fewer of them than lumps
   int64_t numLumps = 0, numLevels = 0;
   for (int i = 0; i < 10; i++) {

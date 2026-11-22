@@ -196,8 +196,7 @@ struct Errors {
 double gpuSolveMs(const Solver& solver, const MetalMirror<float>& dataGpu, const vector<float>& rhs,
                   int nRHS, const MetalSolveOptions& options, int reps = 5,
                   vector<float>* result = nullptr) {
-  MetalSolveOptions saved = metalSolveOptions();
-  metalSolveOptions() = options;
+  MetalSolveOptionsScope scope(options);
   vector<double> times;
   vector<float> x = rhs;
   for (int r = 0; r < reps; r++) {
@@ -207,7 +206,6 @@ double gpuSolveMs(const Solver& solver, const MetalMirror<float>& dataGpu, const
     times.push_back((metalStats().gpuSeconds - s0.gpuSeconds) * 1e3);
     xGpu.get(x);
   }
-  metalSolveOptions() = saved;
   if (result) {
     *result = x;
   }

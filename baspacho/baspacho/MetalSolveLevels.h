@@ -186,7 +186,8 @@ inline int64_t metalLevelThreads(int64_t maxLumpSize, int64_t nRHS) {
 
 // Runs the solve with L (or L^T if transpose) of the lumps in [lumpsBegin, lumpsEnd), as the
 // per-lump loops in Solver::internalSolveLRange (internalSolveLtRange). The levels must have been
-// computed from lumpsBegin. For each level:
+// computed from a lump <= lumpsBegin (eg. 0, one schedule for all the ranges): restricted to
+// [lumpsBegin, lumpsEnd) they still respect the dependencies. For each level:
 // - the rows of its lumps are updated (one dispatch, large lumps split in chunks of rows)
 // - the lumps up to maxDiag rows are solved with their diagonal block (one dispatch, one
 //   threadgroup per lump), the larger ones by the tiled kernels (which use many threadgroups)

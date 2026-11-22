@@ -957,7 +957,7 @@ inline void levelUpdate(device const int64_t* lumpStart, device const int64_t* s
                 }
                 const int64_t lStart = lumpStart[l];
                 const int w = int(lumpStart[l + 1] - lStart);
-                device const float* blk = data + chainData[rowChainIdx[q]] + r * w;
+                device const float* blk = data + chainData[rowChainIdx[q]] + int64_t(r) * w;
                 device const float* xl = x + lStart + k * ldc;
                 for (int j = 0; j < w; j++) {
                     acc += blk[j] * xl[j];
@@ -979,7 +979,7 @@ inline void levelUpdate(device const int64_t* lumpStart, device const int64_t* s
                 device const float* blk = data + chainData[c] + i;  // ns x n block, column i
                 device const float* xs = x + sStart + k * ldc;
                 for (int r = 0; r < ns; r++) {
-                    acc += blk[r * n] * xs[r];
+                    acc += blk[int64_t(r) * n] * xs[r];
                 }
             }
             x[start + i + k * ldc] -= acc;

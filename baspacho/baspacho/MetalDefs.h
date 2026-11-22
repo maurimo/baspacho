@@ -69,7 +69,9 @@ struct MetalStats {
 };
 MetalStats metalStats();
 
-// Options of the solves (for benchmarks and tests, not thread safe; the defaults are tuned)
+// Options of the solves, for benchmarks and tests (the defaults are tuned). The solves run by a
+// thread use the defaults, or the options of the innermost MetalSolveOptionsScope alive in that
+// thread: overrides are local, they can't leak to other threads or outlive the scope
 struct MetalSolveOptions {
   // solve the dense lumps level by level (see MetalSolveLevels.h), else lump by lump
   bool levelSolve = true;
@@ -78,7 +80,19 @@ struct MetalSolveOptions {
   // 1 RHS, 256 for more (from MetalSolverTest.DenseLumpSolveBench on the CI runners)
   int64_t levelMaxDiagLump = -1;
 };
-MetalSolveOptions& metalSolveOptions();
+MetalSolveOptions metalSolveOptions();  // current options of the calling thread
+
+class MetalSolveOptionsScope {
+ public:
+  explicit MetalSolveOptionsScope(const MetalSolveOptions& options);
+  ~MetalSolveOptionsScope();
+  MetalSolveOptionsScope(const MetalSolveOptionsScope&) = delete;
+  MetalSolveOptionsScope& operator=(const MetalSolveOptionsScope&) = delete;
+
+ private:
+  MetalSolveOptions options;
+  const MetalSolveOptions* prev;
+};
 
 // Error checking for Metal operations: throws std::runtime_error (the process can recover, eg.
 // falling back to another backend)
