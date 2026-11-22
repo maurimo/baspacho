@@ -850,22 +850,71 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     }
   }
 
+  // With the stats enabled (Solver::enableStats) an op is timed by its GPU execution time: the work
+  // before it is flushed, then the op is run alone in its command buffer(s) (so the time includes
+  // the fixed cost of a command buffer, see MetalComputationModelTest)
+  template <typename Stat, typename F, typename... Args>
+  void gpuTimed(Stat& stat, F&& op, const Args&... args) {
+    if (!stat.enabled) {
+      op();
+      return;
+    }
+    stream.flush();
+    double g0 = metalStats().gpuSeconds;
+    op();
+    stream.flush();
+    double t = metalStats().gpuSeconds - g0;
+    stat.numRuns++;
+    stat.lastTime = t;
+    stat.maxTime = std::max(stat.maxTime, t);
+    stat.totTime += t;
+    if (stat.callBack) {
+      stat.callBack(t, args...);
+    }
+  }
+
   virtual void potrf(int64_t n, float* data, int64_t offA) override {
+    gpuTimed(sym.potrfStat, [&] { potrfImpl(n, data, offA); }, (int)sizeof(float), (int)n);
+  }
+
+  virtual void trsm(int64_t n, int64_t k, float* data, int64_t offA, int64_t offB) override {
+    gpuTimed(sym.trsmStat, [&] { trsmImpl(n, k, data, offA, offB); }, (int)sizeof(float),
+             (int)n, (int)k);
+  }
+
+  virtual void saveSyrkGemm(int64_t m, int64_t n, int64_t k, const float* data,
+                            int64_t offset) override {
+    gpuTimed(sym.sygeStat, [&] { saveSyrkGemmImpl(m, n, k, data, offset); }, (int)sizeof(float),
+             (int)m, (int)n, (int)k);
+  }
+
+  virtual void assemble(float* data, int64_t rectRowBegin, int64_t dstStride,
+                        int64_t srcColDataOffset, int64_t srcRectWidth, int64_t numBlockRows,
+                        int64_t numBlockCols) override {
+    gpuTimed(
+        sym.asmblStat,
+        [&] {
+          assembleImpl(data, rectRowBegin, dstStride, srcColDataOffset, srcRectWidth,
+                       numBlockRows, numBlockCols);
+        },
+        (int)sizeof(float), (int)numBlockRows, (int)numBlockCols);
+  }
+
+  void potrfImpl(int64_t n, float* data, int64_t offA) {
     if (n <= 0) return;
     MetalBufRef d = findMetalBuf(data, "MetalNumericCtx<float>::potrf");
     MetalBufRef status{(__bridge id<MTLBuffer>)potrfStatus.buffer(), 0};
     MetalDense::potrf(stream, d, n, offA, status);
   }
 
-  virtual void trsm(int64_t n, int64_t k, float* data, int64_t offA, int64_t offB) override {
+  void trsmImpl(int64_t n, int64_t k, float* data, int64_t offA, int64_t offB) {
     if (n <= 0 || k <= 0) return;
     MetalBufRef d = findMetalBuf(data, "MetalNumericCtx<float>::trsm");
     MetalDense::trsm(stream, d, n, k, offA, offB);
   }
 
   // tempBuffer (n x m, row-major) = B * A^T, A (m x k) and B (n x k) both starting at offset
-  virtual void saveSyrkGemm(int64_t m, int64_t n, int64_t k, const float* data,
-                            int64_t offset) override {
+  void saveSyrkGemmImpl(int64_t m, int64_t n, int64_t k, const float* data, int64_t offset) {
     @autoreleasepool {
       if (m <= 0 || n <= 0 || k <= 0) return;
 
@@ -950,9 +999,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     }
   }
 
-  virtual void assemble(float* data, int64_t rectRowBegin, int64_t dstStride,
-                        int64_t srcColDataOffset, int64_t srcRectWidth, int64_t numBlockRows,
-                        int64_t numBlockCols) override {
+  void assembleImpl(float* data, int64_t rectRowBegin, int64_t dstStride,
+                    int64_t srcColDataOffset, int64_t srcRectWidth, int64_t numBlockRows,
+                    int64_t numBlockCols) {
     @autoreleasepool {
       if (numBlockRows <= 0 || numBlockCols <= 0) return;
 

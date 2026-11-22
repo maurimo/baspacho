@@ -88,6 +88,13 @@ jobs:
           (cd "$RUNNER_TEMP" && ./MetalRobustnessTest --gtest_filter='*ReadmeExample*') || status=$?
           mv build-hidden build
           exit $status
+      - name: Fit Metal computation model
+        if: always()
+        run: |
+          # timings of the factor operations on this runner, fitted model parameters
+          ./build/baspacho/tests/MetalComputationModelTest 2>&1 | tee model.log || true
+          grep -E "^metal model|^    \{" model.log | \
+            while read -r line; do echo "::notice title=Metal model ${{ matrix.os }}::$line"; done
       - name: Report Metal accuracy
         if: always()
         run: |
