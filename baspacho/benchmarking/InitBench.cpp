@@ -459,6 +459,19 @@ static uint64_t skelHash(const Solver& solver) {
   return h;
 }
 
+// flops of the supernodal factorization (potrf, trsm, syrk/gemm of each lump, at the scalar level
+// including the explicit zeros): deterministic proxy of the factor cost, to compare analyses
+static double factorFlops(const CoalescedBlockMatrixSkel& skel) {
+  double flops = 0;
+  for (int64_t l = 0; l < skel.numLumps(); l++) {
+    double n = skel.lumpStart[l + 1] - skel.lumpStart[l];
+    double colData = skel.chainData[skel.chainColPtr[l + 1]] - skel.chainData[skel.chainColPtr[l]];
+    double r = colData / n - n;  // rows below the diagonal block
+    flops += n * n * n / 3 + n * n * r + n * r * r;
+  }
+  return flops;
+}
+
 static double minOf(const vector<double>& v) { return *min_element(v.begin(), v.end()); }
 
 // returns false if the solution is inaccurate (or not finite)
@@ -540,11 +553,12 @@ static bool runBackend(const Problem& p, const Opts& o, BackendType backend, con
   double createWarm = minOf(vector<double>(tCreate.begin() + 1, tCreate.end()));
   printf(
       "%-28s %-8s create(cold)=%9.4fs create=%9.4fs factor=%9.4fs solve=%9.4fs "
-      "create/factor=%6.2f nnzL=%lld lumps=%lld elimRanges=%zu relErr=%.1e skelHash=%016llx\n",
+      "create/factor=%6.2f nnzL=%lld lumps=%lld elimRanges=%zu relErr=%.1e skelHash=%016llx "
+      "flops=%.4g\n",
       p.name.c_str(), label.c_str(), tCreate[0], createWarm, minOf(tFactor), minOf(tSolve),
       createWarm / minOf(tFactor), (long long)solver->dataSize(),
       (long long)solver->skel().numLumps(), solver->sparseEliminationRanges().size(), relErr,
-      (unsigned long long)skelHash(*solver));
+      (unsigned long long)skelHash(*solver), factorFlops(solver->skel()));
   fflush(stdout);
   if (!(relErr <= 1e-6)) {  // also NaN
     fprintf(stderr, "ERROR: large relative error %g on %s/%s\n", relErr, p.name.c_str(),
