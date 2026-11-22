@@ -150,3 +150,34 @@ TEST(SparseStructure, FillReducingPermutation) {
   SparseStructure ss = ssOrig.symmetricPermutation(invPerm, false).addFullEliminationFill();
   ASSERT_LE(ss.inds.size(), 130);  // should be 120
 }
+
+// rows of a CSR structure as sets (order and duplicates ignored)
+static vector<set<int64_t>> rowSets(const SparseStructure& ss) {
+  vector<set<int64_t>> retv(ss.ptrs.size() - 1);
+  for (size_t r = 0; r + 1 < ss.ptrs.size(); r++) {
+    retv[r].insert(ss.inds.begin() + ss.ptrs[r], ss.inds.begin() + ss.ptrs[r + 1]);
+  }
+  return retv;
+}
+
+// Duplicate entries (as row 1 having column 0 twice) give a single entry in the result, and
+// entries in the upper half (row 1, column 2) are ignored, with or without sorting
+TEST(SparseStructure, IndependentEliminationFill_DuplicatesAndUpperEntries) {
+  SparseStructure ss;
+  ss.ptrs = {0, 1, 5, 6};
+  ss.inds = {0, 0, 0, 1, 2, 2};
+  for (bool sortIdx : {true, false}) {
+    SparseStructure filled = ss.addIndependentEliminationFill(0, 1, sortIdx);
+    ASSERT_EQ(filled.ptrs.size(), 4);
+    vector<set<int64_t>> expected = {{0}, {0, 1}, {2}};
+    EXPECT_EQ(rowSets(filled), expected) << "sortIdx=" << sortIdx;
+    // no duplicates: each row has as many entries as its set
+    for (int64_t r = 0; r < 3; r++) {
+      EXPECT_EQ(filled.ptrs[r + 1] - filled.ptrs[r], (int64_t)expected[r].size())
+          << "row " << r << ", sortIdx=" << sortIdx;
+    }
+    if (sortIdx) {
+      EXPECT_THAT(filled.inds, ElementsAre(0, 0, 1, 2));
+    }
+  }
+}

@@ -52,7 +52,7 @@ struct SparseStructure {
   // return `perm`: `perm[i]` is old index that should move in `i`-th position
   std::vector<int64_t> fillReducingPermutation() const;
 
-  SparseStructure extractRightBottom(int64_t start);
+  SparseStructure extractRightBottom(int64_t start) const;
 };
 
 }  // end namespace BaSpaCho

@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include "baspacho/baspacho/AnalysisParallel.h"
 #include "baspacho/baspacho/Solver.h"
 #include <dispenso/parallel_for.h>
 #include <Eigen/Eigenvalues>
@@ -21,6 +22,39 @@ using namespace std;
 using hrc = chrono::high_resolution_clock;
 using tdelta = chrono::duration<double>;
 
+namespace {
+// Optional breakdown of symbolic-analysis timings, printed to stderr when the
+// environment variable BASPACHO_ANALYSIS_TIMINGS is set.
+struct AnalysisTimer {
+  explicit AnalysisTimer(const char* label_)
+      : label(label_), on(getenv("BASPACHO_ANALYSIS_TIMINGS") != nullptr), last(hrc::now()) {}
+  void mark(const char* phase) {
+    if (!on) {
+      return;
+    }
+    auto now = hrc::now();
+    phases.emplace_back(phase, tdelta(now - last).count());
+    last = now;
+  }
+  ~AnalysisTimer() {
+    if (!on) {
+      return;
+    }
+    double tot = 0;
+    fprintf(stderr, "[%s]", label);
+    for (auto& [name, t] : phases) {
+      fprintf(stderr, " %s=%.2fms", name, t * 1e3);
+      tot += t;
+    }
+    fprintf(stderr, " total=%.2fms\n", tot * 1e3);
+  }
+  const char* label;
+  bool on;
+  hrc::time_point last;
+  std::vector<std::pair<const char*, double>> phases;
+};
+}  // namespace
+
 Solver::Solver(CoalescedBlockMatrixSkel&& factorSkel_, std::vector<int64_t>&& sparseElimRanges_,
                std::vector<int64_t>&& permutation_, OpsPtr&& ops_, int64_t canFactorUpTo_)
     : factorSkel(std::move(factorSkel_)),
@@ -31,12 +65,16 @@ Solver::Solver(CoalescedBlockMatrixSkel&& factorSkel_, std::vector<int64_t>&& sp
   if (canFactorUpTo < 0) {
     canFactorUpTo = factorSkel.numSpans();
   }
+  AnalysisTimer timer("baspacho solver-init");
   symCtx = ops->createSymbolicCtx(factorSkel, permutation);
+  timer.mark("symCtx");
   for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
     elimCtxs.push_back(symCtx->prepareElimination(sparseElimRanges[l], sparseElimRanges[l + 1]));
   }
+  timer.mark("prepElim");
 
   initElimination();
+  timer.mark("initElim");
 }
 
 // a batched op (T = vector<S*>) with no matrix in the batch is a no-op: the GPU backends would
@@ -650,6 +688,49 @@ void Solver::resetStats() {
   symCtx->solveAssVTStat.reset();
 }
 
+// Computes the first `numCols` columns (as csc, lower half, sorted) of the symmetric
+// permutation of the lower-csr matrix `ss`, assuming that `invPerm` is the identity
+// on [0, numCols). Equivalent to taking the first columns of
+// `ss.symmetricPermutation(invPerm, false).transpose()`, but without processing
+// the full matrix. Output: colPtr (numCols + 1 entries), rowInd.
+static void leadingColumnsOfPermuted(const SparseStructure& ss, const vector<int64_t>& invPerm,
+                                     int64_t numCols, vector<int64_t>& colPtr,
+                                     vector<int64_t>& rowInd) {
+  int64_t ord = ss.order();
+  colPtr.assign(numCols + 1, 0);
+  rowInd.clear();
+  if (numCols == 0) {
+    return;
+  }
+  for (int64_t i = 0; i < ord; i++) {
+    for (int64_t q = ss.ptrs[i], qEnd = ss.ptrs[i + 1]; q < qEnd; q++) {
+      int64_t j = ss.inds[q];
+      if (j < numCols) {
+        colPtr[j]++;
+      }
+    }
+  }
+  int64_t tot = cumSumVec(colPtr);
+  rowInd.resize(tot);
+  for (int64_t i = 0; i < ord; i++) {
+    int64_t newI = invPerm[i];
+    for (int64_t q = ss.ptrs[i], qEnd = ss.ptrs[i + 1]; q < qEnd; q++) {
+      int64_t j = ss.inds[q];
+      if (j < numCols) {
+        BASPACHO_CHECK_LE(j, newI);
+        rowInd[colPtr[j]++] = newI;
+      }
+    }
+  }
+  rewindVec(colPtr);
+  analysisParallelFor(0L, numCols, 4096L,
+                         [&](int64_t c0, int64_t c1) {
+                           for (int64_t c = c0; c < c1; c++) {
+                             std::sort(rowInd.begin() + colPtr[c], rowInd.begin() + colPtr[c + 1]);
+                           }
+                         });
+}
+
 OpsPtr getBackend(const Settings& settings) {
   if (settings.backend == BackendFast) {
     return fastOps(settings.numThreads);
@@ -668,8 +749,12 @@ OpsPtr getBackend(const Settings& settings) {
 SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& paramSize,
                        const SparseStructure& ss_, const std::vector<int64_t>& sparseElimRanges,
                        const unordered_set<int64_t>& elimLastIds) {
+  // the analysis uses at most settings.numThreads threads (serial, no thread pool, with 1)
+  AnalysisThreadsScope analysisThreads(settings.numThreads);
+
   // no point in providing "elim last" ids if not allowing solve up to such set
   BASPACHO_CHECK(settings.addFillPolicy == AddFillComplete || elimLastIds.empty());
+  AnalysisTimer timer("baspacho analysis");
 
   BASPACHO_CHECK((int64_t)sparseElimRanges.size() != 1);
   int64_t givenSparseElimEnd = sparseElimRanges.empty() ? 0 : sparseElimRanges.back();
@@ -683,12 +768,19 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
     }
   }
 
-  SparseStructure ss = ss_;
+  // avoid copying the input structure when no fill has to be added
+  SparseStructure filledSs;
+  const SparseStructure* ssPtr = &ss_;
   if (settings.addFillPolicy != AddFillNone) {
     for (int64_t e = 0; e < (int64_t)sparseElimRanges.size() - 1; e++) {
-      ss = ss.addIndependentEliminationFill(sparseElimRanges[e], sparseElimRanges[e + 1]);
+      filledSs =
+          ssPtr->addIndependentEliminationFill(sparseElimRanges[e], sparseElimRanges[e + 1]);
+      ssPtr = &filledSs;
     }
   }
+  const SparseStructure& ss = *ssPtr;
+
+  timer.mark("elimFill");
 
   // create a factor where either no fill is added, either limited for given elims
   if (settings.addFillPolicy == AddFillNone || settings.addFillPolicy == AddFillForGivenElims) {
@@ -714,9 +806,11 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   }
 
   SparseStructure ssBottom = ss.extractRightBottom(givenSparseElimEnd);
+  timer.mark("extractBR");
 
   // find best permutation for right-bottom corner that is left
   vector<int64_t> permutation = ssBottom.fillReducingPermutation();
+  timer.mark("amd");
   vector<int64_t> noCrossPoints;
   if (!elimLastIds.empty()) {  // force those params to go last
     vector<int64_t> parts[2];
@@ -736,6 +830,8 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
     sortedBottomParamSize[invPerm[i - givenSparseElimEnd]] = paramSize[i];
   }
 
+  timer.mark("permuteBR");
+
   // auto select computation model (for node merge heuristic), if not provided
   const ComputationModel* compModel = settings.computationModel ? settings.computationModel
                                       : settings.backend == BackendCuda
@@ -744,10 +840,14 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
 
   // compute as ordinary elimination tree on br-corner
   EliminationTree et(sortedBottomParamSize, sortedSsBottom, compModel);
+  timer.mark("etInit");
   et.buildTree();
+  timer.mark("etBuild");
   et.processTree(settings.findSparseEliminationRanges, noCrossPoints,
                  settings.addFillPolicy == AddFillForAutoElims);
+  timer.mark("etProcess");
   et.computeAggregateStruct(settings.addFillPolicy == AddFillForAutoElims);
+  timer.mark("etAggregate");
 
   // ss last rows are to be permuted according to etTotalInvPerm
   vector<int64_t> etTotalInvPerm = composePermutations(et.permInverse, invPerm);
@@ -771,27 +871,29 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   shiftConcat(fullLumpToSpan, givenSparseElimEnd, et.lumpToSpan.begin(), et.lumpToSpan.end());
   BASPACHO_CHECK_EQ((int64_t)fullSpanStart.size() - 1, fullLumpToSpan.back());
 
-  // matrix with blocks not joined, we will need the first columns
-  SparseStructure sortedSsT = ss.symmetricPermutation(fullInvPerm, false).transpose();
+  // the first `givenSparseElimEnd` columns (csc, lower half) of the permuted matrix,
+  // the permutation is the identity on such columns, and they are not affected by
+  // the elimination fill of the bottom-right corner.
+  timer.mark("perms");
+  vector<int64_t> fullColStart, fullRowParam;
+  leadingColumnsOfPermuted(ss, fullInvPerm, givenSparseElimEnd, fullColStart, fullRowParam);
+  timer.mark("permuteFull");
 
-  // fullColStart joining sortedSsT.ptrs + shifted elimEndDataPtr
-  vector<int64_t> fullColStart;
+  // fullColStart joining leading columns + shifted elimEndDataPtr
+  int64_t elimEndDataPtr = fullColStart.back();
+  fullColStart.pop_back();
   fullColStart.reserve(givenSparseElimEnd + et.colStart.size());
-  fullColStart.insert(fullColStart.begin(), sortedSsT.ptrs.begin(),
-                      sortedSsT.ptrs.begin() + givenSparseElimEnd);
-  int64_t elimEndDataPtr = sortedSsT.ptrs[givenSparseElimEnd];
   shiftConcat(fullColStart, elimEndDataPtr, et.colStart.begin(), et.colStart.end());
   BASPACHO_CHECK_EQ(fullColStart.size(), fullLumpToSpan.size());
 
-  // fullRowParam joining sortedSsT.inds and et.rowParam (moved)
-  vector<int64_t> fullRowParam;
+  // fullRowParam joining leading columns' rows and et.rowParam
   fullRowParam.reserve(elimEndDataPtr + et.rowParam.size());
-  fullRowParam.insert(fullRowParam.begin(), sortedSsT.inds.begin(),
-                      sortedSsT.inds.begin() + elimEndDataPtr);
   shiftConcat(fullRowParam, givenSparseElimEnd, et.rowParam.begin(), et.rowParam.end());
   BASPACHO_CHECK_EQ((int64_t)fullRowParam.size(), fullColStart.back());
 
+  timer.mark("concat");
   CoalescedBlockMatrixSkel factorSkel(fullSpanStart, fullLumpToSpan, fullColStart, fullRowParam);
+  timer.mark("skel");
 
   // include (additional) progressive Schur elimination sets, shifted
   std::vector<int64_t> fullSparseElimRanges = sparseElimRanges;
@@ -805,10 +907,14 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   }
   int64_t fullSparseElimEnd = fullSparseElimRanges.empty() ? 0 : fullSparseElimRanges.back();
 
-  return SolverPtr(new Solver(
+  OpsPtr ops = getBackend(settings);
+  timer.mark("backend");
+  SolverPtr solver(new Solver(
       std::move(factorSkel), std::move(fullSparseElimRanges), std::move(fullInvPerm),
-      getBackend(settings),
+      std::move(ops),
       settings.addFillPolicy == AddFillForAutoElims ? fullSparseElimEnd : paramSize.size()));
+  timer.mark("solverCtor");
+  return solver;
 }
 
 }  // end namespace BaSpaCho

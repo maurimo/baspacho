@@ -37,7 +37,10 @@ void EliminationTree::buildTree() {
   // skeleton of the algo to iterate on fillup's nodes is from Eigen's
   // `SimplicialCholesky_impl.h` (by Gael Guennebaud),
   // in turn from LDL by Timothy A. Davis.
-  perColNodes.resize(ord);
+  // The off-diagonal structure of L is collected by rows (L(k,i), i < k) in flat
+  // arrays, and then transposed to get the (sorted) columns.
+  vector<int64_t> lRowPtr(ord + 1, 0), lRowCols;
+  lRowCols.reserve(2 * ss.inds.size());
   for (int64_t k = 0; k < ord; ++k) {
     /* L(k,:) pattern: all nodes reachable in etree from nz in A(0:k-1,k) */
     parent[k] = -1; /* parent of k is not yet known */
@@ -62,24 +65,45 @@ void EliminationTree::buildTree() {
         /* L(k,i) is nonzero */
         nodeRows[i] += paramSize[k];
         nodeRowBlocks[i]++;
-        perColNodes[i].push_back(k);
+        lRowCols.push_back(i);
+      }
+    }
+    lRowPtr[k + 1] = lRowCols.size();
+  }
+
+  // columns of L, including the diagonal entry (first), rows are sorted
+  vector<int64_t> lColPtr(ord + 1);
+  lColPtr[0] = 0;
+  for (int64_t i = 0; i < ord; i++) {
+    lColPtr[i + 1] = lColPtr[i] + nodeRowBlocks[i] + 1;
+  }
+  vector<int64_t> lColRows(lColPtr[ord]);
+  {
+    vector<int64_t> pos(lColPtr.begin(), lColPtr.end() - 1);
+    for (int64_t i = 0; i < ord; i++) {
+      lColRows[pos[i]++] = i;
+    }
+    for (int64_t k = 0; k < ord; k++) {
+      for (int64_t q = lRowPtr[k], qEnd = lRowPtr[k + 1]; q < qEnd; q++) {
+        lColRows[pos[lRowCols[q]]++] = k;
       }
     }
   }
+  lRowCols = vector<int64_t>();  // release memory
 
   sygeCosts.resize(ord);
   asmblCosts.resize(ord);
   perRowNodeStats.resize(ord);
-  for (int64_t col = 0; col < (int64_t)perColNodes.size(); col++) {
-    auto& c = perColNodes[col];
-    c.push_back(col);
-    sort(c.begin(), c.end());
-
+  for (int64_t row = 0; row < ord; row++) {
+    perRowNodeStats[row].clear();
+    perRowNodeStats[row].reserve(lRowPtr[row + 1] - lRowPtr[row] + 1);
+  }
+  for (int64_t col = 0; col < ord; col++) {
     int64_t skippedRows = 0;
     int64_t skippedBlocks = 0;
     Eigen::Vector2d sygeC{0, 0}, asmblC{0, 0};
-    for (int64_t i = c.size() - 1; i >= 0; i--) {
-      int64_t row = c[i];
+    for (int64_t q = lColPtr[col + 1] - 1; q >= lColPtr[col]; q--) {
+      int64_t row = lColRows[q];
 
       sygeC += compMod.sygeLinEst(skippedRows + paramSize[row], paramSize[row]);
       asmblC += compMod.asmblLinEst(skippedBlocks + 1);
@@ -369,35 +393,113 @@ void EliminationTree::computeAggregateStruct(bool fillOnlyForElims) {
   int64_t ord = ss.order();
   int64_t numLumps = ord - numMerges;
 
-  SparseStructure tperm =  // lower-half csc
-      ss.symmetricPermutation(permInverse, /* lowerHalf = */ false,
-                              /* sortIndices = */ false);
-
   if (fillOnlyForElims) {
+    SparseStructure tperm =  // lower-half csc
+        ss.symmetricPermutation(permInverse, /* lowerHalf = */ false,
+                                /* sortIndices = */ false);
     for (int64_t e = 0; e < (int64_t)sparseElimRanges.size() - 1; e++) {
       tperm = tperm.addIndependentEliminationFill(sparseElimRanges[e], sparseElimRanges[e + 1]);
     }
-  } else {
-    tperm = tperm.addFullEliminationFill();
-  }
-  tperm = tperm.transpose();
+    tperm = tperm.transpose();
 
-  vector<int64_t> tags(ord, -1);  // check if row el was added already
-  colStart.push_back(0);
+    vector<int64_t> tags(ord, -1);  // check if row el was added already
+    colStart.push_back(0);
+    for (int64_t a = 0; a < numLumps; a++) {
+      int64_t aStart = lumpToSpan[a];
+      int64_t aEnd = lumpToSpan[a + 1];
+      int64_t pStart = tperm.ptrs[aStart];
+      int64_t pEnd = tperm.ptrs[aEnd];
+      for (int64_t i = pStart; i < pEnd; i++) {
+        int64_t p = tperm.inds[i];
+        if (tags[p] < (int64_t)a) {
+          rowParam.push_back(p);  // L(p,a) is set
+          tags[p] = a;
+        }
+      }
+      sort(rowParam.begin() + colStart[colStart.size() - 1], rowParam.end());
+      colStart.push_back(rowParam.size());
+    }
+    return;
+  }
+
+  // Supernodal symbolic factorization: the structure of (merged) lump `a` is the
+  // union of the diagonal block, the entries of A in the columns of `a`, and the
+  // structures of the children lumps (the lumps whose first row below the diagonal
+  // block falls in `a`). This is equivalent to computing the full elimination fill
+  // and taking the union of the columns of each lump, but it only costs as much as
+  // the size of the lump-level structure.
+  vector<int64_t> spanToLump(ord);
+  for (int64_t a = 0; a < numLumps; a++) {
+    for (int64_t sp = lumpToSpan[a]; sp < lumpToSpan[a + 1]; sp++) {
+      spanToLump[sp] = a;
+    }
+  }
+
+  // entries of the permuted A (lower half), grouped by lump of column
+  vector<int64_t> lumpAPtr(numLumps + 1, 0);
+  for (int64_t i = 0; i < ord; i++) {
+    int64_t newI = permInverse[i];
+    for (int64_t q = ss.ptrs[i], qEnd = ss.ptrs[i + 1]; q < qEnd; q++) {
+      int64_t newJ = permInverse[ss.inds[q]];
+      lumpAPtr[spanToLump[std::min(newI, newJ)]]++;
+    }
+  }
+  cumSumVec(lumpAPtr);
+  vector<int64_t> lumpARows(lumpAPtr[numLumps]);
+  for (int64_t i = 0; i < ord; i++) {
+    int64_t newI = permInverse[i];
+    for (int64_t q = ss.ptrs[i], qEnd = ss.ptrs[i + 1]; q < qEnd; q++) {
+      int64_t newJ = permInverse[ss.inds[q]];
+      lumpARows[lumpAPtr[spanToLump[std::min(newI, newJ)]]++] = std::max(newI, newJ);
+    }
+  }
+  rewindVec(lumpAPtr);
+
+  vector<int64_t> firstChild(numLumps, -1), nextSibling(numLumps, -1);
+  vector<int64_t> tags(ord, -1);
+  colStart.assign(1, 0);
+  rowParam.clear();
+  rowParam.reserve(lumpARows.size() + ord);
   for (int64_t a = 0; a < numLumps; a++) {
     int64_t aStart = lumpToSpan[a];
     int64_t aEnd = lumpToSpan[a + 1];
-    int64_t pStart = tperm.ptrs[aStart];
-    int64_t pEnd = tperm.ptrs[aEnd];
-    for (int64_t i = pStart; i < pEnd; i++) {
-      int64_t p = tperm.inds[i];
-      if (tags[p] < (int64_t)a) {
-        rowParam.push_back(p);  // L(p,a) is set
-        tags[p] = a;
+    // diagonal block
+    for (int64_t sp = aStart; sp < aEnd; sp++) {
+      rowParam.push_back(sp);
+      tags[sp] = a;
+    }
+    int64_t belowDiag = rowParam.size();
+
+    // entries of A
+    for (int64_t q = lumpAPtr[a], qEnd = lumpAPtr[a + 1]; q < qEnd; q++) {
+      int64_t r = lumpARows[q];
+      if (tags[r] != a) {
+        BASPACHO_CHECK_GE(r, aEnd);
+        tags[r] = a;
+        rowParam.push_back(r);
       }
     }
-    sort(rowParam.begin() + colStart[colStart.size() - 1], rowParam.end());
+
+    // structures of children
+    for (int64_t b = firstChild[a]; b != -1; b = nextSibling[b]) {
+      for (int64_t q = colStart[b], qEnd = colStart[b + 1]; q < qEnd; q++) {
+        int64_t r = rowParam[q];
+        if (r >= aEnd && tags[r] != a) {
+          tags[r] = a;
+          rowParam.push_back(r);
+        }
+      }
+    }
+
+    sort(rowParam.begin() + belowDiag, rowParam.end());
     colStart.push_back(rowParam.size());
+
+    // register as child of the lump containing the first row below the diagonal
+    if ((int64_t)rowParam.size() > belowDiag) {
+      int64_t p = spanToLump[rowParam[belowDiag]];
+      nextSibling[a] = firstChild[p];
+      firstChild[p] = a;
+    }
   }
 }
 
