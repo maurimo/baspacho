@@ -110,7 +110,7 @@ void testCreateSolver_Many(bool elimSet, bool lastIds) {
     {  // exact symbolic analysis (full structure of L, merges from the computation model)
       Settings settings;
       settings.backend = BackendRef;
-      settings.fastAnalysis = false;
+      settings.analysis = AnalysisExact;
       auto solver = createSolver(settings, paramSize, ss, sparseElimRanges, elimLastIds);
       ASSERT_EQ(solver->canFactorUpToSpan(), numParams);
       check<T>(*solver, 4 * i + 0, elimLastIds);

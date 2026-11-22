@@ -8,8 +8,6 @@
 #include "baspacho/baspacho/EliminationTree.h"
 #include <algorithm>
 #include <queue>
-#include <sstream>
-#include <string>
 #include <tuple>
 #include "baspacho/baspacho/ComputationModel.h"
 #include "baspacho/baspacho/DebugMacros.h"
@@ -264,23 +262,6 @@ void EliminationTree::buildTreeFast() {
 static constexpr double kRelaxSize[3] = {8, 32, 96};
 static constexpr double kRelaxZeros[3] = {0.8, 0.1, 0.05};
 
-// estimated time of the factor ops of a node of `size` (made of `merged` spans), with `rows` rows
-// in `blocks` blocks below the diagonal (assumed of equal size): closed form of the sums over the
-// blocks of the computation model terms (experiments)
-double EliminationTree::estimatedNodeCost(double size, double rows, double blocks,
-                                          double merged) const {
-  const auto& sp = compMod.sygeParams;
-  const auto& ap = compMod.asmblParams;
-  double b = blocks, a = blocks > 0 ? rows / blocks : 0.0, tri = b * (b + 1) / 2;
-  double sumMN = a * (tri + b), sumMxN = a * a * tri;
-  double syge0 = b * sp[0] + sumMN * sp[1] + sumMxN * sp[2];
-  double syge1 = b * sp[3] + sumMN * sp[4] + sumMxN * sp[5];
-  double asmbl0 = b * ap[0] + tri * ap[1];
-  double asmbl1 = b * ap[2] + tri * ap[3];
-  return compMod.potrfEst(size) + compMod.trsmEst(size, rows) + syge0 + syge1 * size + asmbl0 +
-         asmbl1 * merged;
-}
-
 void EliminationTree::computeMergesFast() {
   int64_t ord = ss.order();
   numMergedNodes.assign(ord, 1);
@@ -312,29 +293,9 @@ void EliminationTree::computeMergesFast() {
     double sk = nodeSize[k], sp = nodeSize[p], sm = sk + sp;
     double z = zeros[k] + zeros[p] + sk * std::max(0.0, (double)(nodeRows[p] + sp - nodeRows[k]));
     double frac = z / (sm * (sm + 1) / 2 + sm * nodeRows[p]);
-    static const std::string mode = getenv("BASPACHO_MERGE") ? getenv("BASPACHO_MERGE") : "relax";
-    static const double zcap = getenv("BASPACHO_ZCAP") ? atof(getenv("BASPACHO_ZCAP")) : 0.3;
-    static const std::vector<double> rx = [] {
-      std::vector<double> v = {kRelaxSize[0], kRelaxSize[1], kRelaxSize[2],
-                               kRelaxZeros[0], kRelaxZeros[1], kRelaxZeros[2]};
-      if (const char* e = getenv("BASPACHO_RELAX")) {
-        std::stringstream ss(e);
-        std::string t;
-        for (size_t i = 0; i < v.size() && std::getline(ss, t, ','); i++) v[i] = atof(t.c_str());
-      }
-      return v;
-    }();
-    bool relaxed = z == 0 || sm <= rx[0] || (sm <= rx[1] && frac < rx[3]) ||
-                   (sm <= rx[2] && frac < rx[4]) || frac < rx[5];
-    bool costBetter = false;
-    if (mode != "relax") {
-      double tk = estimatedNodeCost(sk, nodeRows[k], nodeRowBlocks[k], numMergedNodes[k]);
-      double tp = estimatedNodeCost(sp, nodeRows[p], nodeRowBlocks[p], numMergedNodes[p]);
-      double tm = estimatedNodeCost(sm, nodeRows[p], nodeRowBlocks[p],
-                                    numMergedNodes[p] + numMergedNodes[k]);
-      costBetter = tm < tk + tp && frac < zcap;
-    }
-    bool willMerge = mode == "relax" ? relaxed : mode == "cost" ? costBetter : relaxed || costBetter;
+    bool willMerge = z == 0 || sm <= kRelaxSize[0] ||
+                     (sm <= kRelaxSize[1] && frac < kRelaxZeros[0]) ||
+                     (sm <= kRelaxSize[2] && frac < kRelaxZeros[1]) || frac < kRelaxZeros[2];
     if (willMerge) {
       zeros[p] = z;
       mergeWith[k] = p;

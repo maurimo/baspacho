@@ -58,9 +58,6 @@ struct EliminationTree {
   // internal (called by processTree, after buildTreeFast)
   void computeMergesFast();
 
-  // (experiments) estimated time of the factor ops of a node
-  double estimatedNodeCost(double size, double rows, double blocks, double merged) const;
-
   bool fastSymbolic = false;  // set by buildTreeFast
 
   // internal (called by processTree)

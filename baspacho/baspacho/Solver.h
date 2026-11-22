@@ -223,18 +223,28 @@ struct ComputationModel;
 /**
  * Settings for `createSolver` function below (symbolic analysis of a sparse block matrix).
  */
+// symbolic analysis, see Settings::analysis
+enum AnalysisMode {
+  AnalysisAuto,   // fast on the CPU backends, exact on the GPU ones
+  AnalysisFast,   // elimination tree + column counts, relaxed amalgamation
+  AnalysisExact,  // full structure of the factor, merges chosen by the computation model
+};
+
 struct Settings {
   bool findSparseEliminationRanges = true;
   int numThreads = 16;
   BackendType backend = BackendFast;
   AddFillPolicy addFillPolicy = AddFillComplete;
   const ComputationModel* computationModel = nullptr;
-  // Symbolic analysis: if true (default) the supernodes are found from the elimination tree and
-  // the column counts of the factor, in O(nnz(A)), merging nodes by relaxed amalgamation (bounded
-  // fraction of explicit zeros). If false, the full structure of the factor is computed and nodes
-  // are merged when faster according to `computationModel`: much slower on large problems, and
-  // usually not faster to factor
-  bool fastAnalysis = true;
+  // Symbolic analysis. Fast: the supernodes are found from the elimination tree and the column
+  // counts of the factor, in O(nnz(A)), merging nodes by relaxed amalgamation (bounded fraction of
+  // explicit zeros), independently of the backend. Exact: the full structure of the factor is
+  // computed and nodes are merged when faster according to `computationModel`, 2-30x slower on
+  // large problems. On the CPU the fast analysis gives a factorization as fast (+1.4% estimated by
+  // the computation model, geometric mean over a suite of problems), but on the GPUs the larger
+  // per-operation cost makes the model-driven merges much better (+46% with the fast analysis on
+  // CUDA, +90% on Metal), so Auto uses the fast analysis on the CPU backends only
+  AnalysisMode analysis = AnalysisAuto;
 };
 
 /**

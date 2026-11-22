@@ -875,16 +875,21 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   timer.mark("permuteBR");
 
   // auto select computation model (for node merge heuristic), if not provided
+  BackendType backend =
+      settings.backend == BackendAuto ? detectBestBackend() : settings.backend;
+  bool gpu = backend == BackendCuda || backend == BackendMetal;
   const ComputationModel* compModel =
-      settings.computationModel           ? settings.computationModel
-      : settings.backend == BackendCuda  ? &ComputationModel::model_Cuda117_2080Ti
-      : settings.backend == BackendMetal ? &ComputationModel::model_Metal_CI_paravirtual
-                                         : &ComputationModel::model_OpenBlas_i7_1185g7;
+      settings.computationModel  ? settings.computationModel
+      : backend == BackendCuda  ? &ComputationModel::model_Cuda117_2080Ti
+      : backend == BackendMetal ? &ComputationModel::model_Metal_CI_paravirtual
+                                : &ComputationModel::model_OpenBlas_i7_1185g7;
+  bool fastAnalysis =
+      settings.analysis == AnalysisFast || (settings.analysis == AnalysisAuto && !gpu);
 
   // compute as ordinary elimination tree on br-corner
   EliminationTree et(sortedBottomParamSize, sortedSsBottom, compModel);
   timer.mark("etInit");
-  if (settings.fastAnalysis) {
+  if (fastAnalysis) {
     et.buildTreeFast();
   } else {
     et.buildTree();

@@ -582,7 +582,7 @@ static void runModels(const Problem& p, const Opts& o) {
       settings.numThreads = o.numThreads;
       settings.findSparseEliminationRanges = o.autoElim;
       settings.computationModel = model;
-      settings.fastAnalysis = fast;
+      settings.analysis = fast ? AnalysisFast : AnalysisExact;
       vector<int64_t> elimRanges;
       if (o.givenElim && p.numElim > 0) elimRanges = {0, p.numElim};
       double tCreate = 1e30;
