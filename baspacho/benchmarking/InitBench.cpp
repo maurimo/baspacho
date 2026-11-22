@@ -492,18 +492,32 @@ struct ModelNumericCtx : NumericCtx<double> {
       }
     }
   }
-  void potrf(int64_t n, double*, int64_t) override { time += model.potrfEst(n); }
+  void add(int op, double t) {
+    time += t;
+    opTime[op] += t;
+    opCount[op]++;
+  }
+  void potrf(int64_t n, double*, int64_t) override { add(0, model.potrfEst(n)); }
   void trsm(int64_t n, int64_t k, double*, int64_t, int64_t) override {
-    time += model.trsmEst(n, k);
+    add(1, model.trsmEst(n, k));
   }
   void saveSyrkGemm(int64_t m, int64_t n, int64_t k, const double*, int64_t) override {
-    time += model.sygeEst(m, n, k);
+    add(2, model.sygeEst(m, n, k));
   }
   void prepareAssemble(int64_t) override {}
   void assemble(double*, int64_t, int64_t, int64_t, int64_t, int64_t numBlockRows,
                 int64_t numBlockCols) override {
-    time += model.asmblEst(numBlockRows, numBlockCols);
+    add(3, model.asmblEst(numBlockRows, numBlockCols));
   }
+  ~ModelNumericCtx() override {
+    if (getenv("BASPACHO_MERGE_DEBUG")) {
+      fprintf(stderr, "MOCK potrf %.6g/%lld trsm %.6g/%lld syge %.6g/%lld asmbl %.6g/%lld\n",
+              opTime[0], (long long)opCount[0], opTime[1], (long long)opCount[1], opTime[2],
+              (long long)opCount[2], opTime[3], (long long)opCount[3]);
+    }
+  }
+  double opTime[4] = {0, 0, 0, 0};
+  int64_t opCount[4] = {0, 0, 0, 0};
   const CoalescedBlockMatrixSkel& skel;
   const ComputationModel& model;
   double& time;

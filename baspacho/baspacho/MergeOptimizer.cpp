@@ -45,8 +45,9 @@ MergeOptimizer::MergeOptimizer(const ComputationModel& model, vector<int64_t> pa
 }
 
 double MergeOptimizer::colCost(int64_t c, double n) const {
-  return model.potrfEst(n) + model.trsmEst(n, rows[c]) + colSyge[c][0] + colSyge[c][1] * n +
-         colAsmbl[c];
+  // (factorLump calls no trsm without rows below the diagonal)
+  return model.potrfEst(n) + (rows[c] > 0 ? model.trsmEst(n, rows[c]) : 0.0) + colSyge[c][0] +
+         colSyge[c][1] * n + colAsmbl[c];
 }
 
 int64_t MergeOptimizer::root(int64_t a) {
@@ -206,12 +207,24 @@ void MergeOptimizer::bestFirst(int passes) {
 
 double MergeOptimizer::evaluate(const vector<vector<Board>>& colBoards) {
   double tot = 0;
+  for (int i = 0; i < 4; i++) {
+    opTime[i] = 0;
+    opCount[i] = 0;
+  }
   for (int64_t c = 0; c < numNodes; c++) {
     if (mergeWith[c] != -1 || sparse[c]) {
       continue;
     }
     double n = size[c];
     double t = model.potrfEst(n) + model.trsmEst(n, rows[c]);
+    opTime[0] += model.potrfEst(n);
+    opCount[0]++;
+    if (rows[c] > 0) {
+      opTime[1] += model.trsmEst(n, rows[c]);
+      opCount[1]++;
+    } else {
+      t -= model.trsmEst(n, 0);  // (no trsm without rows below the diagonal)
+    }
     // group the boards of the top node by lump
     const auto& bs = colBoards[c];
     for (size_t i = 0; i < bs.size();) {
@@ -225,6 +238,10 @@ double MergeOptimizer::evaluate(const vector<vector<Board>>& colBoards) {
       }
       t += model.sygeEst(m, m + bs[j - 1].rowsDown, n) +
            model.asmblEst(bc + bs[j - 1].brDown, bc);
+      opTime[2] += model.sygeEst(m, m + bs[j - 1].rowsDown, n);
+      opTime[3] += model.asmblEst(bc + bs[j - 1].brDown, bc);
+      opCount[2]++;
+      opCount[3]++;
       i = j;
     }
     tot += t;

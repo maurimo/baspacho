@@ -749,8 +749,13 @@ void EliminationTree::debugMergeEstimates() {
       opt.applyMerge(k, p);
     }
   }
-  fprintf(stderr, "MERGEDEBUG fast=%d oldEstimate=%.6g exact=%.6g eval=%.6g unmerged=%.6g\n",
-          (int)fastSymbolic, oldEst, opt.total, opt.evaluate(in.colBoards), unmerged);
+  double ev = opt.evaluate(in.colBoards);
+  fprintf(stderr,
+          "MERGEDEBUG fast=%d oldEstimate=%.6g exact=%.6g eval=%.6g unmerged=%.6g | potrf "
+          "%.6g/%lld trsm %.6g/%lld syge %.6g/%lld asmbl %.6g/%lld\n",
+          (int)fastSymbolic, oldEst, opt.total, ev, unmerged, opt.opTime[0],
+          (long long)opt.opCount[0], opt.opTime[1], (long long)opt.opCount[1], opt.opTime[2],
+          (long long)opt.opCount[2], opt.opTime[3], (long long)opt.opCount[3]);
 }
 
 // collapse pointer to parent, make parent become root ancestor

@@ -64,6 +64,10 @@ struct MergeOptimizer {
 
   double colCost(int64_t c, double n) const;
 
+  // set by evaluate: per operation (potrf, trsm, syge, asmbl) time and number of calls
+  double opTime[4] = {0, 0, 0, 0};
+  int64_t opCount[4] = {0, 0, 0, 0};
+
   const ComputationModel& model;
   int64_t numNodes;
   std::vector<int64_t> parent, size, spans, rows;
