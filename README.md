@@ -1,7 +1,4 @@
 <p align="center">
-    <a href="https://dl.circleci.com/status-badge/redirect/gh/facebookresearch/baspacho/tree/main">
-        <img src="https://dl.circleci.com/status-badge/img/gh/facebookresearch/baspacho/tree/main.svg?style=svg&circle-token=a463b80560b6b9db75f7810a171f3c65e8dcad7b" alt="CircleCI" height="20">
-    </a>
     <a href="https://github.com/maurimo/baspacho/actions/workflows/ci.yml">
         <img src="https://github.com/maurimo/baspacho/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" height="20">
     </a>
