@@ -8,6 +8,8 @@
 #include "baspacho/baspacho/EliminationTree.h"
 #include <algorithm>
 #include <queue>
+#include <sstream>
+#include <string>
 #include <tuple>
 #include "baspacho/baspacho/ComputationModel.h"
 #include "baspacho/baspacho/DebugMacros.h"
@@ -281,6 +283,19 @@ void EliminationTree::computeMergesFast() {
   // costz (cost, and at most BASPACHO_ZCAP fraction of explicit zeros in the merged node)
   static const std::string mode = getenv("BASPACHO_MERGE") ? getenv("BASPACHO_MERGE") : "cost";
   static const double zcap = getenv("BASPACHO_ZCAP") ? atof(getenv("BASPACHO_ZCAP")) : 0.3;
+  // relaxed amalgamation thresholds (CHOLMOD's defaults): sizes n0 < n1 < n2, zero fractions
+  // z0 > z1 > z2: merge if no zeros, or size <= n0, or size <= n1 and zeros < z0, ...
+  static const std::vector<double> rx = [] {
+    std::vector<double> v = {4, 16, 48, 0.8, 0.1, 0.05};
+    if (const char* e = getenv("BASPACHO_RELAX")) {
+      std::stringstream ss(e);
+      std::string t;
+      for (size_t i = 0; i < v.size() && std::getline(ss, t, ','); i++) {
+        v[i] = atof(t.c_str());
+      }
+    }
+    return v;
+  }();
   vector<double> zeros(ord, 0.0);  // explicit zeros in the (merged) node
   auto mergedZeros = [&](int64_t k, int64_t p) {
     // the columns of k get the rows of p (and its diagonal block) they don't have
@@ -315,10 +330,21 @@ void EliminationTree::computeMergesFast() {
     }
     double z = mergedZeros(k, p);
     bool willMerge;
-    if (mode == "relax") {
+    auto relaxed = [&] {
       double sm = nodeSize[k] + nodeSize[p], frac = zeroFraction(k, p, z);
-      willMerge = z == 0 || sm <= 4 || (sm <= 16 && frac < 0.8) || (sm <= 48 && frac < 0.1) ||
-                  frac < 0.05;
+      return z == 0 || sm <= rx[0] || (sm <= rx[1] && frac < rx[3]) ||
+             (sm <= rx[2] && frac < rx[4]) || frac < rx[5];
+    };
+    if (mode == "relax") {
+      willMerge = relaxed();
+    } else if (mode == "relaxcost") {  // relaxed, or faster by the cost model (zeros < zcap)
+      double tk =
+          estimatedNodeCost(nodeSize[k], nodeRows[k], nodeRowBlocks[k], numMergedNodes[k]);
+      double tp =
+          estimatedNodeCost(nodeSize[p], nodeRows[p], nodeRowBlocks[p], numMergedNodes[p]);
+      double tm = estimatedNodeCost(nodeSize[p] + nodeSize[k], nodeRows[p], nodeRowBlocks[p],
+                                    numMergedNodes[p] + numMergedNodes[k]);
+      willMerge = relaxed() || (tm < tk + tp && zeroFraction(k, p, z) < zcap);
     } else {
       double tk =
           estimatedNodeCost(nodeSize[k], nodeRows[k], nodeRowBlocks[k], numMergedNodes[k]);
