@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "mau/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_GENERATOR: Ninja
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux, CPU only: builds library, tests, examples/benchmarks and runs ctest.
+  # ---------------------------------------------------------------------------
+  linux-cpu:
+    name: Linux CPU (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc, OpenBLAS
+            cc: gcc
+            cxx: g++
+            cmake_args: -DCMAKE_BUILD_TYPE=Release -DBASPACHO_USE_BLAS=ON
+          - name: clang, OpenBLAS
+            cc: clang-18
+            cxx: clang++-18
+            # cmake/BundleStaticLibrary.cmake requires an `llvm-ar` for Clang; GNU ar works too
+            cmake_args: -DCMAKE_BUILD_TYPE=Release -DBASPACHO_USE_BLAS=ON -DLLVM_AR=/usr/bin/ar
+          - name: gcc, no BLAS (Eigen fallback), SuiteSparse AMD
+            cc: gcc
+            cxx: g++
+            cmake_args: -DCMAKE_BUILD_TYPE=Release -DBASPACHO_USE_BLAS=OFF -DBASPACHO_USE_SUITESPARSE_AMD=ON
+          - name: gcc, ASan+UBSan
+            cc: gcc
+            cxx: g++
+            cmake_args: >-
+              -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBASPACHO_USE_BLAS=ON -DBASPACHO_BUILD_EXAMPLES=OFF
+              "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined"
+              "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined"
+              "-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address,undefined"
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build libopenblas-dev libsuitesparse-dev
+      - name: Configure
+        run: cmake -S . -B build -DBASPACHO_USE_CUBLAS=OFF ${{ matrix.cmake_args }}
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Test
+        uses: ./.github/actions/ctest
+        with:
+          label: ctest linux ${{ matrix.name }}
+          args: -j"$(nproc)"
+
+  # ---------------------------------------------------------------------------
+  # macOS (Apple Silicon), CPU only.
+  # ---------------------------------------------------------------------------
+  macos-cpu:
+    name: macOS CPU (${{ matrix.os }}, ${{ matrix.blas }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+        blas: [OpenBLAS, Apple]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install dependencies
+        run: brew install ninja openblas suite-sparse llvm
+      - name: Configure
+        # cmake/BundleStaticLibrary.cmake needs `llvm-ar` (Apple's ar has no -M scripts)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBASPACHO_USE_CUBLAS=OFF \
+            -DBLA_VENDOR=${{ matrix.blas }} -DLLVM_AR="$(brew --prefix llvm)/bin/llvm-ar" \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix openblas);$(brew --prefix suite-sparse)"
+      - name: Build
+        run: cmake --build build -j"$(sysctl -n hw.ncpu)"
+      - name: Test
+        uses: ./.github/actions/ctest
+        with:
+          label: ctest ${{ matrix.os }} ${{ matrix.blas }}
+          args: -j"$(sysctl -n hw.ncpu)"
+
+  # ---------------------------------------------------------------------------
+  # CUDA: GitHub-hosted runners have no NVIDIA GPU, so this only checks that
+  # library, tests and benchmarks compile against several CUDA toolkits, and
+  # runs the CPU tests of that build. Running the Cuda* tests needs a GPU
+  # runner (GitHub "larger runners" with GPU, or a self-hosted runner).
+  # ---------------------------------------------------------------------------
+  cuda-build:
+    name: CUDA ${{ matrix.cuda }} build (archs ${{ matrix.archs }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container: nvidia/cuda:${{ matrix.cuda }}-devel-ubuntu24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda: 12.9.2
+            archs: "52;75;86" # 52 exercises the legacy double-atomicAdd path
+          - cuda: 13.4.3
+            archs: "75;86;120"
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates cmake ninja-build g++ libopenblas-dev libsuitesparse-dev
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBASPACHO_USE_CUBLAS=ON \
+            -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+            "-DBASPACHO_CUDA_ARCHS=${{ matrix.archs }}" \
+            "-DCMAKE_CUDA_FLAGS=-Wno-deprecated-gpu-targets"
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Run CPU-only tests
+        uses: ./.github/actions/ctest
+        with:
+          label: ctest CUDA ${{ matrix.cuda }} build (CPU tests only)
+          args: -E "Cuda" -j"$(nproc)"
