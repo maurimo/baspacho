@@ -514,6 +514,7 @@ static AnalysisMode analysisMode(const string& a) {
   if (a == "exact") return AnalysisExact;
   if (a == "fast") return AnalysisFast;
   if (a == "deep") return AnalysisDeep;
+  if (a == "relaxed") return AnalysisRelaxed;
   if (a == "auto" || a.empty()) return AnalysisAuto;
   throw runtime_error("unknown analysis " + a + " (auto, fast, exact, deep)");
 }

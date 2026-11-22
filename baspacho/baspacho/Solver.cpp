@@ -889,6 +889,9 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   if (settings.analysis == AnalysisFast || settings.analysis == AnalysisAuto) {
     et.buildTreeFast();
     et.mergeMode = EliminationTree::MergeOptimized;
+  } else if (settings.analysis == AnalysisRelaxed) {
+    et.buildTreeFast();
+    et.mergeMode = EliminationTree::MergeRelaxed;
   } else {
     et.buildTree();  // (the structure of L, needed by the previous analysis)
     et.mergeMode = settings.analysis == AnalysisDeep ? EliminationTree::MergeDeep
