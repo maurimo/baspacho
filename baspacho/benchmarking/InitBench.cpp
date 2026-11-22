@@ -29,6 +29,7 @@
 #include <typeindex>
 #include <unordered_map>
 #include "baspacho/baspacho/ComputationModel.h"
+#include "baspacho/baspacho/FactorTimeEstimate.h"
 #include "baspacho/baspacho/MatOps.h"
 #include "baspacho/baspacho/Solver.h"
 #include "baspacho/baspacho/SparseStructure.h"
@@ -441,10 +442,10 @@ struct Opts {
   bool verbose = false;
   bool createOnly = false;
   vector<string> models;  // -model: estimate the factor time with computation models
-  bool fastOnly = false;  // -fastOnly: with -model, skip the exact analysis
-  bool exactOnly = false;  // -exactOnly: with -model, skip the fast analysis
+  vector<string> modes = {"exact", "fast"};  // -modes: analyses compared by -model
+  int deepIters = 0;                         // -deepIters: Settings::deepSearchIterations
   string cm;              // -cm: computation model of the analysis in factor runs
-  string analysis;        // -analysis exact|fast (default: auto)
+  string analysis;        // -analysis exact|fast|deep (default: auto)
   string collect;         // -collect file: append the timings of the factor operations
 };
 
@@ -469,113 +470,12 @@ static uint64_t skelHash(const Solver& solver) {
   return h;
 }
 
-// "Model" backend: runs the factorization loops of the Solver on the skeleton only (no numeric
-// data is allocated, data pointers are null), adding the time estimated by a computation model
-// for each operation of the supernodal (dense) part. The sparse elimination (not covered by the
-// model, and batched on the GPU backends) is estimated separately, per lump, as its potrf, the
-// trsm and syrk of all the rows below, and the assembly of its blocks.
-struct ModelSymElimCtx : SymElimCtx {};
-
-struct ModelNumericCtx : NumericCtx<double> {
-  ModelNumericCtx(const CoalescedBlockMatrixSkel& skel, const ComputationModel& model, double& time,
-                  double& sparseTime)
-      : skel(skel), model(model), time(time), sparseTime(sparseTime) {}
-  void pseudoFactorSpans(double*, int64_t, int64_t) override {
-    throw runtime_error("model backend: pseudoFactorSpans not supported");
-  }
-  void doElimination(const SymElimCtx&, double*, int64_t lumpsBegin, int64_t lumpsEnd) override {
-    for (int64_t l = lumpsBegin; l < lumpsEnd; l++) {
-      double n = skel.lumpStart[l + 1] - skel.lumpStart[l];
-      int64_t c0 = skel.chainColPtr[l], c1 = skel.chainColPtr[l + 1];
-      int64_t nDiag = skel.lumpToSpan[l + 1] - skel.lumpToSpan[l];
-      double rows = skel.chainRowsTillEnd[c1 - 1] - skel.chainRowsTillEnd[c0 + nDiag - 1];
-      double blocks = c1 - c0 - nDiag;
-      sparseTime += model.potrfEst(n);
-      if (blocks > 0) {
-        sparseTime += model.trsmEst(n, rows) + model.sygeEst(rows, rows, n) +
-                      model.asmblEst(blocks, blocks);
-      }
-    }
-  }
-  void add(int op, double t) {
-    time += t;
-    opTime[op] += t;
-    opCount[op]++;
-  }
-  void potrf(int64_t n, double*, int64_t) override { add(0, model.potrfEst(n)); }
-  void trsm(int64_t n, int64_t k, double*, int64_t, int64_t) override {
-    add(1, model.trsmEst(n, k));
-  }
-  void saveSyrkGemm(int64_t m, int64_t n, int64_t k, const double*, int64_t) override {
-    add(2, model.sygeEst(m, n, k));
-  }
-  void prepareAssemble(int64_t) override {}
-  void assemble(double*, int64_t, int64_t, int64_t, int64_t, int64_t numBlockRows,
-                int64_t numBlockCols) override {
-    add(3, model.asmblEst(numBlockRows, numBlockCols));
-  }
-  ~ModelNumericCtx() override {
-    if (getenv("BASPACHO_MERGE_DEBUG")) {
-      fprintf(stderr, "MOCK potrf %.6g/%lld trsm %.6g/%lld syge %.6g/%lld asmbl %.6g/%lld\n",
-              opTime[0], (long long)opCount[0], opTime[1], (long long)opCount[1], opTime[2],
-              (long long)opCount[2], opTime[3], (long long)opCount[3]);
-    }
-  }
-  double opTime[4] = {0, 0, 0, 0};
-  int64_t opCount[4] = {0, 0, 0, 0};
-  const CoalescedBlockMatrixSkel& skel;
-  const ComputationModel& model;
-  double& time;
-  double& sparseTime;
-};
-
-struct ModelSymbolicCtx : SymbolicCtx {
-  ModelSymbolicCtx(const CoalescedBlockMatrixSkel& skel, const ComputationModel& model,
-                   double& time, double& sparseTime)
-      : skel(skel), model(model), time(time), sparseTime(sparseTime) {}
-  SymElimCtxPtr prepareElimination(int64_t, int64_t) override {
-    return SymElimCtxPtr(new ModelSymElimCtx);
-  }
-  NumericCtxBase* createNumericCtxForType(type_index tIdx, int64_t, int) override {
-    if (tIdx != type_index(typeid(double))) {
-      throw runtime_error("model backend: double only");
-    }
-    return new ModelNumericCtx(skel, model, time, sparseTime);
-  }
-  SolveCtxBase* createSolveCtxForType(type_index, int, int) override {
-    throw runtime_error("model backend: no solve");
-  }
-  PermutedCoalescedAccessor deviceAccessor() override { return PermutedCoalescedAccessor(); }
-  const CoalescedBlockMatrixSkel& skel;
-  const ComputationModel& model;
-  double& time;
-  double& sparseTime;
-};
-
-struct ModelOps : Ops {
-  ModelOps(const ComputationModel& model, double& time, double& sparseTime)
-      : model(model), time(time), sparseTime(sparseTime) {}
-  SymbolicCtxPtr createSymbolicCtx(const CoalescedBlockMatrixSkel& skel,
-                                   const vector<int64_t>&) override {
-    return SymbolicCtxPtr(new ModelSymbolicCtx(skel, model, time, sparseTime));
-  }
-  const ComputationModel& model;
-  double& time;
-  double& sparseTime;
-};
-
 // time of the factorization of `solver`'s factor estimated by `model` (no data allocated):
 // supernodal part, and estimate of the sparse elimination part
 static pair<double, double> modelledFactorTime(const Solver& solver,
                                                const ComputationModel& model) {
-  double time = 0, sparseTime = 0;
-  CoalescedBlockMatrixSkel skel = solver.skel();
-  vector<int64_t> ranges = solver.sparseEliminationRanges();
-  vector<int64_t> perm = solver.paramToSpan();
-  Solver modelSolver(std::move(skel), std::move(ranges), std::move(perm),
-                     OpsPtr(new ModelOps(model, time, sparseTime)));
-  modelSolver.factor<double>(nullptr);
-  return {time, sparseTime};
+  FactorTimeEstimate e = solver.estimatedFactorTime(model);
+  return {e.supernodal, e.sparse};
 }
 
 // a model by name, or "file:path" with the 20 parameters (potrf 4, trsm 6, syge 6, asmbl 4)
@@ -599,26 +499,33 @@ static const ComputationModel* namedModel(const string& name) {
   if (name == "cpu") return &ComputationModel::model_OpenBlas_i7_1185g7;
   if (name == "cuda") return &ComputationModel::model_Cuda117_2080Ti;
   if (name == "metal") return &ComputationModel::model_Metal_CI_paravirtual;
-  throw runtime_error("unknown model " + name + " (cpu, cuda, metal)");
+  if (name == "cpu-nonneg") return &ComputationModel::model_OpenBlas_i7_1185g7_nonneg;
+  if (name == "cuda-bounded") return &ComputationModel::model_Cuda117_2080Ti_bounded;
+  throw runtime_error("unknown model " + name +
+                      " (cpu, cuda, metal, cpu-nonneg, cuda-bounded, file:path)");
 }
 
 // for each model: analysis (exact with that model, and fast) and estimated factor time
+static AnalysisMode analysisMode(const string& a) {
+  if (a == "exact") return AnalysisExact;
+  if (a == "fast") return AnalysisFast;
+  if (a == "deep") return AnalysisDeep;
+  if (a == "auto" || a.empty()) return AnalysisAuto;
+  throw runtime_error("unknown analysis " + a + " (auto, fast, exact, deep)");
+}
+
 static void runModels(const Problem& p, const Opts& o) {
   for (const string& m : o.models) {
     const ComputationModel* model = namedModel(m);
     printf("%-28s model=%-5s", p.name.c_str(), m.c_str());
-    for (bool fast : {false, true}) {
-      if ((!fast && o.fastOnly) || (fast && o.exactOnly)) {
-        printf(" %s: analysis=%9.4fs factor(model)=%9.4fs sparse(model)=%9.4fs nnzL=0 lumps=0 |",
-               fast ? "fast" : "exact", 0.0, 0.0, 0.0);
-        continue;
-      }
+    for (const string& mode : o.modes) {
       Settings settings;
       settings.backend = BackendRef;  // not used: the analysis only depends on the model
       settings.numThreads = o.numThreads;
       settings.findSparseEliminationRanges = o.autoElim;
       settings.computationModel = model;
-      settings.analysis = fast ? AnalysisFast : AnalysisExact;
+      settings.analysis = analysisMode(mode);
+      settings.deepSearchIterations = o.deepIters;
       vector<int64_t> elimRanges;
       if (o.givenElim && p.numElim > 0) elimRanges = {0, p.numElim};
       double tCreate = 1e30;
@@ -630,8 +537,9 @@ static void runModels(const Problem& p, const Opts& o) {
         tCreate = min(tCreate, tdelta(hrc::now() - t0).count());
       }
       auto [tFactor, tSparse] = modelledFactorTime(*solver, *model);
-      printf(" %s: analysis=%9.4fs factor(model)=%9.4fs sparse(model)=%9.4fs nnzL=%lld lumps=%lld |",
-             fast ? "fast" : "exact", tCreate, tFactor, tSparse, (long long)solver->dataSize(),
+      printf(" %s: analysis=%9.4fs factor(model)=%9.4fs sparse(model)=%9.4fs nnzL=%lld "
+             "lumps=%lld |",
+             mode.c_str(), tCreate, tFactor, tSparse, (long long)solver->dataSize(),
              (long long)solver->skel().numLumps());
     }
     printf("\n");
@@ -661,8 +569,8 @@ static bool runBackend(const Problem& p, const Opts& o, BackendType backend, con
   settings.numThreads = o.numThreads;
   settings.findSparseEliminationRanges = o.autoElim;
   if (!o.cm.empty()) settings.computationModel = namedModel(o.cm);
-  if (o.analysis == "exact") settings.analysis = AnalysisExact;
-  if (o.analysis == "fast") settings.analysis = AnalysisFast;
+  settings.analysis = analysisMode(o.analysis);
+  settings.deepSearchIterations = o.deepIters;
   vector<int64_t> elimRanges;
   if (o.givenElim && p.numElim > 0) elimRanges = {0, p.numElim};
 
@@ -795,7 +703,9 @@ static void help() {
        << "  -model list   only analysis, factor time estimated by the computation models in the\n"
        << "                comma separated list (cpu, cuda, metal, file:path), exact and fast\n"
        << "  -cm name      computation model of the analysis in factor runs (and its estimate)\n"
-       << "  -analysis a   exact or fast (default auto)\n"
+       << "  -analysis a   fast, exact or deep (default auto)\n"
+       << "  -modes list   analyses compared by -model (default exact,fast)\n"
+       << "  -deepIters n  rounds of local search of the deep analysis\n"
        << "  -collect f    append the timings of the factor operations to f\n"
        << "  -maxbs n      max detected block size for -mtx (default 16)\n";
 }
@@ -817,8 +727,12 @@ static int run(int argc, char* argv[]) {
     else if (a == "-mtx") mtx = next();
     else if (a == "-grid3d") gridN = stoi(next()), gridBs = stoi(next());
     else if (a == "-gen") genSpec = next();
-    else if (a == "-fastOnly") o.fastOnly = true;
-    else if (a == "-exactOnly") o.exactOnly = true;
+    else if (a == "-modes") {
+      stringstream ms(next());
+      string m;
+      o.modes.clear();
+      while (getline(ms, m, ',')) o.modes.push_back(m);
+    } else if (a == "-deepIters") o.deepIters = stoi(next());
     else if (a == "-cm") o.cm = next();
     else if (a == "-analysis") o.analysis = next();
     else if (a == "-collect") o.collect = next();

@@ -111,6 +111,9 @@ struct ComputationModel {
   // pre-built model collection
   static const ComputationModel model_OpenBlas_i7_1185g7;
   static const ComputationModel model_Cuda117_2080Ti;
+  // sanitized versions of the above (see ComputationModel.cpp), used by default
+  static const ComputationModel model_OpenBlas_i7_1185g7_nonneg;
+  static const ComputationModel model_Cuda117_2080Ti_bounded;
   static const ComputationModel model_Metal_CI_paravirtual;
 };
 

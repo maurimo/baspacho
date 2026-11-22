@@ -10,6 +10,7 @@
 #include <memory>
 #include <unordered_set>
 #include "baspacho/baspacho/CoalescedBlockMatrix.h"
+#include "baspacho/baspacho/FactorTimeEstimate.h"
 #include "baspacho/baspacho/MatOps.h"
 #include "baspacho/baspacho/SparseStructure.h"
 
@@ -36,6 +37,9 @@ class Solver {
   // constructor, from RAW factor skeleton (do not call directly, use createSolver)
   Solver(CoalescedBlockMatrixSkel&& factorSkel, std::vector<int64_t>&& sparseElimRanges,
          std::vector<int64_t>&& permutation, OpsPtr&& ops, int64_t canFactorUpTo = -1);
+
+  // time of the factorization estimated by a computation model (no data allocated)
+  FactorTimeEstimate estimatedFactorTime(const ComputationModel& model) const;
 
   // return a (permuted) accessor to access factor's block (re-ordering is auto-applied)
   PermutedCoalescedAccessor accessor() const {
@@ -225,9 +229,10 @@ struct ComputationModel;
  */
 // symbolic analysis, see Settings::analysis
 enum AnalysisMode {
-  AnalysisAuto,   // fast on the CPU backends, exact on the GPU ones
-  AnalysisFast,   // elimination tree + column counts, relaxed amalgamation
-  AnalysisExact,  // full structure of the factor, merges chosen by the computation model
+  AnalysisAuto,   // currently the same as AnalysisFast
+  AnalysisFast,   // column counts, small supernodes, merges optimized with the computation model
+  AnalysisExact,  // (previous analysis) full structure of the factor, greedy merges
+  AnalysisDeep,   // slower, optimizing the merges from several starting points
 };
 
 struct Settings {
@@ -236,15 +241,23 @@ struct Settings {
   BackendType backend = BackendFast;
   AddFillPolicy addFillPolicy = AddFillComplete;
   const ComputationModel* computationModel = nullptr;
-  // Symbolic analysis. Fast: the supernodes are found from the elimination tree and the column
-  // counts of the factor, in O(nnz(A)), merging nodes by relaxed amalgamation (bounded fraction of
-  // explicit zeros), independently of the backend. Exact: the full structure of the factor is
-  // computed and nodes are merged when faster according to `computationModel`, 2-30x slower on
-  // large problems. On the CPU the fast analysis gives a factorization as fast (+1.4% estimated by
-  // the computation model, geometric mean over a suite of problems), but on the GPUs the larger
-  // per-operation cost makes the model-driven merges much better (+46% with the fast analysis on
-  // CUDA, +90% on Metal), so Auto uses the fast analysis on the CPU backends only
+  // Symbolic analysis: how the parameters are merged into supernodes (lumps), choosing the merges
+  // that minimize the time of the factorization estimated by `computationModel`, with the exact
+  // cost of the operations issued by `factor` (which depends on the merges of the rows too).
+  // * Fast: the elimination tree and the column counts of the factor (O(nnz(A))) give the
+  //   fundamental supernodes (capped in size, a large dense supernode is often better split) and
+  //   the relaxed supernodes (bounded fraction of explicit zeros); from each, merges are made by
+  //   steepest descent on the estimated time, and the better result is kept.
+  // * Exact: the previous analysis, merging greedily on an estimate of the merge's effect on
+  //   the two nodes only (it misses most of the operations saved, and adds a fake one per node).
+  // * Deep: as Fast, but on the structure of single parameters, from more starting points
+  //   (including Exact's result, so it is never worse according to the model), followed by
+  //   `deepSearchIterations` rounds of iterated local search. 3-10x slower than Fast.
+  // Estimated with sane computation models on a suite of 39 problems, the factorization is
+  // 3-13% faster with Fast than with Exact (geometric means for CPU, CUDA, Metal models), and Fast
+  // takes 0.4-0.55x the time of Exact; Deep is about as good as Fast.
   AnalysisMode analysis = AnalysisAuto;
+  int deepSearchIterations = 0;
 };
 
 /**

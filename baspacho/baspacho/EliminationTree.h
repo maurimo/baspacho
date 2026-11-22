@@ -60,19 +60,25 @@ struct EliminationTree {
   void computeMergesFast();
 
   bool fastSymbolic = false;  // set by buildTreeFast
-  bool fundamentalOnly = false;  // computeMergesFast: only merges adding no explicit zeros
+  bool fundamentalOnly = false;      // computeMergesFast: only merges adding no zeros...
   double fundamentalMaxSize = 1e30;  // ... and only up to this size (scalar columns)
 
-  // (research) merges chosen by MergeOptimizer with the exact cost model, on top of a coarse
-  // partition ("none": spans, "fund": fundamental supernodes, "relax": relaxed amalgamation)
-  void computeMergesOpt(const std::string& mode, const std::string& coarse);
+  // how the merges are chosen by processTree. Auto: Optimized after buildTreeFast, Greedy after
+  // buildTree. Relaxed: relaxed amalgamation (computeMergesFast). Greedy: computeMerges, greedy
+  // on an estimate of the merge's effect on the two nodes. Optimized/Deep: computeMergesOptimized
+  enum MergeMode { MergeAuto, MergeRelaxed, MergeGreedy, MergeOptimized, MergeDeep };
+  MergeMode mergeMode = MergeAuto;
+  int deepIterations = 0;     // MergeDeep: rounds of iterated local search
+  double optimizedCost = -1;  // set by computeMergesOptimized: estimated time of the factor
 
-  // (research) estimated time of the current merges, by the previous analyzer's bookkeeping
-  // (computeMerges) and by the exact cost (MergeOptimizer)
-  void debugMergeEstimates();
+  // merges minimizing the factor time estimated by the computation model with the exact cost of
+  // the operations (MergeOptimizer, steepest descent): from the (capped) fundamental and the
+  // relaxed supernodes, or (deep) on single spans from more starting points (including the result
+  // of computeMerges after buildTree) followed by `deepIterations` rounds of local search
+  void computeMergesOptimized(bool deep);
 
-  // (research) span-level partition of computeMergesFast (fundamental: only fill-free merges)
-  std::vector<int64_t> partitionFast(bool fundamental);
+  // span-level partition of computeMergesFast (fundamental: only fill-free merges, up to a size)
+  std::vector<int64_t> partitionFast(bool fundamental, double fundamentalCap);
 
   // internal (called by processTree)
   void collapseMergePointers();

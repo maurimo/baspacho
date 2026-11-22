@@ -3,6 +3,7 @@ set(BaSpaCho_sources
     CoalescedBlockMatrix.cpp
     ComputationModel.cpp
     EliminationTree.cpp
+    FactorTimeEstimate.cpp
     MergeOptimizer.cpp
     MatOpsFast.cpp
     MatOpsRef.cpp

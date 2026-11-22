@@ -8,13 +8,9 @@
 #include "baspacho/baspacho/EliminationTree.h"
 #include "baspacho/baspacho/MergeOptimizer.h"
 #include <algorithm>
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
 #include <map>
 #include <queue>
 #include <random>
-#include <string>
 #include <tuple>
 #include "baspacho/baspacho/ComputationModel.h"
 #include "baspacho/baspacho/DebugMacros.h"
@@ -28,7 +24,7 @@ EliminationTree::EliminationTree(const vector<int64_t>& paramSize, const SparseS
                                  const ComputationModel* compMod)
     : paramSize(paramSize),
       ss(ss),
-      compMod(compMod ? *compMod : ComputationModel::model_OpenBlas_i7_1185g7) {
+      compMod(compMod ? *compMod : ComputationModel::model_OpenBlas_i7_1185g7_nonneg) {
   BASPACHO_CHECK_EQ(paramSize.size(), ss.ptrs.size() - 1);
 }
 
@@ -649,9 +645,6 @@ OptInput buildOptInput(const SparseStructure& ss, const vector<int64_t>& paramSi
   return in;
 }
 
-double secondsSince(std::chrono::steady_clock::time_point t0) {
-  return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-}
 
 }  // namespace
 
@@ -665,10 +658,10 @@ static vector<int64_t> currentPartition(EliminationTree& et) {
   return r;
 }
 
-vector<int64_t> EliminationTree::partitionFast(bool fundamental) {
+vector<int64_t> EliminationTree::partitionFast(bool fundamental, double fundamentalCap) {
   nodeSize = paramSize;
   fundamentalOnly = fundamental;
-  fundamentalMaxSize = getenv("BASPACHO_FUNDCAP") ? atof(getenv("BASPACHO_FUNDCAP")) : 1e30;
+  fundamentalMaxSize = fundamentalCap;
   computeMergesFast();
   fundamentalOnly = false;
   auto r = currentPartition(*this);
@@ -676,177 +669,113 @@ vector<int64_t> EliminationTree::partitionFast(bool fundamental) {
   return r;
 }
 
-void EliminationTree::computeMergesOpt(const std::string& mode, const std::string& coarse) {
-  int64_t ord = ss.order();
-  auto t0 = std::chrono::steady_clock::now();
-  bool debug = getenv("BASPACHO_MERGE_DEBUG") != nullptr;
+// Fast: maximum size of the fundamental supernodes the merge optimization starts from (in a
+// large dense supernode the potrf is less efficient than the trsm/syrk of a split one, so they
+// must be splittable). Insensitive between 32 and 128 in the experiments
+static constexpr double kFundamentalCap = 32;
 
-  // candidate starting partitions (span level), and the coarse input: the intersection of the
-  // partitions in `coarse` ("none": spans; intersections of connected subtrees are connected)
-  std::map<std::string, vector<int64_t>> parts;
-  auto part = [&](const std::string& name) -> const vector<int64_t>& {
-    auto it = parts.find(name);
-    if (it != parts.end()) {
-      return it->second;
-    }
-    if (name == "fund") {
-      return parts[name] = partitionFast(true);
-    } else if (name == "relax") {
-      return parts[name] = partitionFast(false);
-    } else if (name == "exact") {
-      BASPACHO_CHECK(!fastSymbolic);  // needs the structure computed by buildTree
-      nodeSize = paramSize;
-      computeMerges();
-      auto r = currentPartition(*this);
-      nodeSize = paramSize;
-      return parts[name] = r;
-    }
-    BASPACHO_CHECK(name == "none");
-    vector<int64_t> r(ord);
-    for (int64_t s = 0; s < ord; s++) r[s] = s;
-    return parts[name] = r;
-  };
-  static const char* startsEnv = getenv("BASPACHO_STARTS");
-  std::string startsStr = startsEnv ? startsEnv : "none";
-  vector<std::string> starts;
-  for (size_t b = 0; b <= startsStr.size();) {
-    size_t e = std::min(startsStr.find(',', b), startsStr.size());
-    starts.push_back(startsStr.substr(b, e - b));
-    b = e + 1;
+void EliminationTree::computeMergesOptimized(bool deep) {
+  int64_t ord = ss.order();
+
+  // starting partitions (span level); the nodes of the optimization are the intersection of the
+  // partitions (connected subtrees: their intersections are connected), single spans for deep
+  vector<vector<int64_t>> starts;
+  if (deep && !fastSymbolic) {
+    nodeSize = paramSize;
+    computeMerges();  // (uses the structure of buildTree, first)
+    starts.push_back(currentPartition(*this));
+    nodeSize = paramSize;
   }
-  for (auto& st : starts) {
-    part(st);  // ("exact" first, it uses the structure of buildTree)
+  starts.push_back(partitionFast(true, deep ? 1e30 : kFundamentalCap));
+  starts.push_back(partitionFast(false, 0));
+  if (deep) {
+    starts.push_back(partitionFast(true, kFundamentalCap));
   }
-  vector<int64_t> label(ord, 0);
-  {
-    std::string cs = coarse;
-    vector<std::string> cparts;
-    for (size_t b = 0; b <= cs.size();) {
-      size_t e = std::min(cs.find('+', b), cs.size());
-      cparts.push_back(cs.substr(b, e - b));
-      b = e + 1;
-    }
-    for (auto& c : cparts) {
-      const auto& pr = part(c);
-      std::map<pair<int64_t, int64_t>, int64_t> ids;
-      for (int64_t s = 0; s < ord; s++) {
-        label[s] = ids.emplace(make_pair(label[s], pr[s]), ids.size()).first->second;
-      }
-    }
-  }
-  // coarse ids increasing with the top (max) span of each group
-  int64_t numLabels = *std::max_element(label.begin(), label.end()) + 1;
-  vector<int64_t> labelTop(numLabels, -1);
-  for (int64_t s = 0; s < ord; s++) {
-    labelTop[label[s]] = std::max(labelTop[label[s]], s);
-  }
-  vector<int64_t> coarseOf(ord), labelId(numLabels, -1);
+  vector<int64_t> coarseOf(ord);
   int64_t numCoarse = 0;
-  for (int64_t s = 0; s < ord; s++) {
-    if (labelTop[label[s]] == s) {
-      labelId[label[s]] = numCoarse++;
+  if (deep) {
+    vector<int64_t> spans(ord);
+    for (int64_t s = 0; s < ord; s++) spans[s] = s;
+    starts.push_back(spans);
+    coarseOf = spans;
+    numCoarse = ord;
+  } else {
+    // label = (fundamental root, relaxed root); ids increasing with the top span of the group
+    const auto& fund = starts[0];
+    const auto& relax = starts[1];
+    std::map<pair<int64_t, int64_t>, int64_t> labelOf;
+    vector<int64_t> label(ord), labelTop;
+    for (int64_t s = 0; s < ord; s++) {
+      auto [it, isNew] = labelOf.emplace(make_pair(fund[s], relax[s]), labelTop.size());
+      if (isNew) labelTop.push_back(-1);
+      label[s] = it->second;
+      labelTop[label[s]] = std::max(labelTop[label[s]], s);
+    }
+    vector<int64_t> labelId(labelTop.size(), -1);
+    for (int64_t s = 0; s < ord; s++) {
+      if (labelTop[label[s]] == s) labelId[label[s]] = numCoarse++;
+    }
+    for (int64_t s = 0; s < ord; s++) {
+      coarseOf[s] = labelId[label[s]];
     }
   }
-  for (int64_t s = 0; s < ord; s++) {
-    coarseOf[s] = labelId[label[s]];
-  }
-  double tCoarse = secondsSince(t0);
 
   OptInput in = buildOptInput(ss, paramSize, parent, coarseOf, numCoarse, forbidMerge,
                               isSparseElim);
-  double tInput = secondsSince(t0);
   auto newOpt = [&]() {
     return MergeOptimizer(compMod, in.parent, in.size, in.spans, in.rows, in.canMerge, in.sparse,
                           in.colBoards);
   };
-  // merges of a partition (of which the coarse nodes are a refinement)
+  // merges of a (span-level) partition of which the nodes are a refinement
   auto replay = [&](MergeOptimizer& o, const vector<int64_t>& spanPart) {
     for (int64_t a = numCoarse - 1; a >= 0; a--) {
       int64_t t = in.top[a];
       if (parent[t] != -1 && spanPart[t] == spanPart[parent[t]]) {
-        int64_t p = o.root(in.parent[a]);
         BASPACHO_CHECK(in.canMerge[a] && !in.sparse[a]);
-        o.applyMerge(a, p);
+        o.applyMerge(a, o.root(in.parent[a]));
       }
-    }
-  };
-  auto run = [&](MergeOptimizer& o) {
-    if (mode == "greedy1") {
-      o.greedy(1);
-    } else if (mode == "greedy") {
-      o.greedy(20);
-    } else if (mode == "best") {
-      o.bestFirst(20);
-    } else if (mode == "steep" || mode == "deep") {
-      o.steepest();
-    } else {
-      BASPACHO_CHECK(mode == "start");  // only the starting partition
     }
   };
 
   vector<int64_t> best(numCoarse);
-  double bestCost = 0, initial = 0;
-  std::string bestStart;
+  double bestCost = 0;
+  bool first = true;
   for (auto& st : starts) {
     MergeOptimizer o = newOpt();
-    initial = o.total;
-    replay(o, part(st));
-    double startCost = o.total;
-    run(o);
-    if (debug) {
-      fprintf(stderr, "MERGESTART %s: start %.6g -> %.6g\n", st.c_str(), startCost, o.total);
-    }
-    if (bestStart.empty() || o.total < bestCost) {
+    replay(o, st);
+    o.steepest();
+    if (first || o.total < bestCost) {
+      first = false;
       bestCost = o.total;
-      bestStart = st;
       for (int64_t a = 0; a < numCoarse; a++) best[a] = o.root(a);
     }
   }
-  int64_t numEvals = 0;
-  if (mode == "deep") {
-    // iterated local search: dissolve a random fraction of the merged lumps, re-merge with a
-    // randomized steepest descent then a plain one, keep if better
-    int iters = getenv("BASPACHO_DEEP_ITERS") ? atoi(getenv("BASPACHO_DEEP_ITERS")) : 10;
-    double frac = getenv("BASPACHO_DEEP_FRAC") ? atof(getenv("BASPACHO_DEEP_FRAC")) : 0.2;
-    double noise = getenv("BASPACHO_DEEP_NOISE") ? atof(getenv("BASPACHO_DEEP_NOISE")) : 0.5;
-    std::mt19937_64 gen(17);
-    std::uniform_real_distribution<double> unif(0.0, 1.0);
-    for (int it = 0; it < iters; it++) {
-      vector<bool> dissolve(numCoarse, false);
-      for (int64_t a = 0; a < numCoarse; a++) {
-        if (best[a] == a) dissolve[a] = unif(gen) < frac;
-      }
-      MergeOptimizer trial = newOpt();
-      for (int64_t k = numCoarse - 1; k >= 0; k--) {
-        if (best[k] != k && !dissolve[best[k]]) {
-          trial.applyMerge(k, trial.root(in.parent[k]));
-        }
-      }
-      trial.steepest(noise, it + 1);
-      trial.steepest();
-      numEvals += trial.numEvals;
-      if (debug) {
-        fprintf(stderr, "DEEP iter %d: %.6g (best %.6g)\n", it, trial.total, bestCost);
-      }
-      if (trial.total < bestCost) {
-        bestCost = trial.total;
-        for (int64_t a = 0; a < numCoarse; a++) best[a] = trial.root(a);
-      }
+  starts.clear();
+
+  // iterated local search: dissolve a random fraction of the merged lumps, re-merge with a
+  // randomized steepest descent then a plain one, keep if better (about 1% better in the
+  // experiments, ie. the steepest descent from the best start is close to a local optimum)
+  std::mt19937_64 gen(17);
+  std::uniform_real_distribution<double> unif(0.0, 1.0);
+  for (int it = 0; deep && it < deepIterations; it++) {
+    vector<bool> dissolve(numCoarse, false);
+    for (int64_t a = 0; a < numCoarse; a++) {
+      if (best[a] == a) dissolve[a] = unif(gen) < 0.2;
     }
-  }
-  double tOpt = secondsSince(t0);
-  if (debug) {
-    MergeOptimizer fin = newOpt();
+    MergeOptimizer trial = newOpt();
     for (int64_t k = numCoarse - 1; k >= 0; k--) {
-      if (best[k] != k) fin.applyMerge(k, fin.root(in.parent[k]));
+      if (best[k] != k && !dissolve[best[k]]) {
+        trial.applyMerge(k, trial.root(in.parent[k]));
+      }
     }
-    fprintf(stderr,
-            "MERGEOPT mode=%s coarse=%s starts=%s best=%s spans=%lld coarseNodes=%lld "
-            "initial=%.6g final=%.6g eval=%.6g evals=%lld tCoarse=%.3f tInput=%.3f tOpt=%.3f\n",
-            mode.c_str(), coarse.c_str(), startsStr.c_str(), bestStart.c_str(), (long long)ord,
-            (long long)numCoarse, initial, bestCost, fin.evaluate(in.colBoards),
-            (long long)numEvals, tCoarse, tInput - tCoarse, tOpt - tInput);
+    trial.steepest(0.5, it + 1);
+    trial.steepest();
+    if (trial.total < bestCost) {
+      bestCost = trial.total;
+      for (int64_t a = 0; a < numCoarse; a++) best[a] = trial.root(a);
+    }
   }
+  optimizedCost = bestCost;
 
   // back to spans: every span merged into the top span of its final lump
   nodeSize = paramSize;
@@ -862,45 +791,6 @@ void EliminationTree::computeMergesOpt(const std::string& mode, const std::strin
       numMerges++;
     }
   }
-}
-
-void EliminationTree::debugMergeEstimates() {
-  int64_t ord = ss.order();
-  // previous analyzer's bookkeeping (meaningful after computeMerges)
-  double oldEst = 0;
-  if (!fastSymbolic && !sygeCosts.empty() && !getenv("BASPACHO_MERGE")) {
-    for (int64_t k = 0; k < ord; k++) {
-      if (mergeWith[k] != -1 || isSparseElim[k]) {
-        continue;
-      }
-      double n = nodeSize[k];
-      oldEst += compMod.potrfEst(n) + compMod.trsmEst(n, nodeRows[k]) + sygeCosts[k][0] +
-                sygeCosts[k][1] * n + asmblCosts[k][0] + asmblCosts[k][1] * numMergedNodes[k];
-    }
-  }
-  // exact cost of the same partition: span-level input, merges replayed
-  vector<int64_t> identity(ord);
-  for (int64_t s = 0; s < ord; s++) {
-    identity[s] = s;
-  }
-  OptInput in = buildOptInput(ss, paramSize, parent, identity, ord, forbidMerge, isSparseElim);
-  MergeOptimizer opt(compMod, in.parent, in.size, in.spans, in.rows, in.canMerge, in.sparse,
-                     in.colBoards);
-  double unmerged = opt.total;
-  for (int64_t k = ord - 1; k >= 0; k--) {
-    if (mergeWith[k] != -1) {
-      int64_t p = opt.root(parent[k]);
-      BASPACHO_CHECK_EQ(in.top[p], mergedRoot(k));
-      opt.applyMerge(k, p);
-    }
-  }
-  double ev = opt.evaluate(in.colBoards);
-  fprintf(stderr,
-          "MERGEDEBUG fast=%d oldEstimate=%.6g exact=%.6g eval=%.6g unmerged=%.6g | potrf "
-          "%.6g/%lld trsm %.6g/%lld syge %.6g/%lld asmbl %.6g/%lld\n",
-          (int)fastSymbolic, oldEst, opt.total, ev, unmerged, opt.opTime[0],
-          (long long)opt.opCount[0], opt.opTime[1], (long long)opt.opCount[1], opt.opTime[2],
-          (long long)opt.opCount[2], opt.opTime[3], (long long)opt.opCount[3]);
 }
 
 // collapse pointer to parent, make parent become root ancestor
@@ -936,18 +826,17 @@ void EliminationTree::processTree(bool detectSparseElimRanges, const vector<int6
     numMergedNodes.assign(ord, 1);
     numMerges = 0;
   } else {
-    static const char* modeEnv = getenv("BASPACHO_MERGE");
-    static const char* coarseEnv = getenv("BASPACHO_COARSE");
-    std::string mode = modeEnv ? modeEnv : "";
-    if (!mode.empty()) {
-      computeMergesOpt(mode, coarseEnv ? coarseEnv : (fastSymbolic ? "fund" : "none"));
-    } else if (fastSymbolic) {
-      computeMergesFast();
-    } else {
-      computeMerges();
+    MergeMode mode = mergeMode;
+    if (mode == MergeAuto) {
+      mode = fastSymbolic ? MergeOptimized : MergeGreedy;
     }
-    if (getenv("BASPACHO_MERGE_DEBUG")) {
-      debugMergeEstimates();
+    if (mode == MergeRelaxed) {
+      computeMergesFast();
+    } else if (mode == MergeGreedy) {
+      BASPACHO_CHECK(!fastSymbolic);  // needs buildTree
+      computeMerges();
+    } else {
+      computeMergesOptimized(mode == MergeDeep);
     }
     collapseMergePointers();
   }

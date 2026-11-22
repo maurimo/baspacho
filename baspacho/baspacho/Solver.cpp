@@ -877,22 +877,23 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   // auto select computation model (for node merge heuristic), if not provided
   BackendType backend =
       settings.backend == BackendAuto ? detectBestBackend() : settings.backend;
-  bool gpu = backend == BackendCuda || backend == BackendMetal;
   const ComputationModel* compModel =
       settings.computationModel  ? settings.computationModel
-      : backend == BackendCuda  ? &ComputationModel::model_Cuda117_2080Ti
+      : backend == BackendCuda  ? &ComputationModel::model_Cuda117_2080Ti_bounded
       : backend == BackendMetal ? &ComputationModel::model_Metal_CI_paravirtual
-                                : &ComputationModel::model_OpenBlas_i7_1185g7;
-  bool fastAnalysis =
-      settings.analysis == AnalysisFast || (settings.analysis == AnalysisAuto && !gpu);
+                                : &ComputationModel::model_OpenBlas_i7_1185g7_nonneg;
 
   // compute as ordinary elimination tree on br-corner
   EliminationTree et(sortedBottomParamSize, sortedSsBottom, compModel);
   timer.mark("etInit");
-  if (fastAnalysis) {
+  if (settings.analysis == AnalysisFast || settings.analysis == AnalysisAuto) {
     et.buildTreeFast();
+    et.mergeMode = EliminationTree::MergeOptimized;
   } else {
-    et.buildTree();
+    et.buildTree();  // (the structure of L, needed by the previous analysis)
+    et.mergeMode = settings.analysis == AnalysisDeep ? EliminationTree::MergeDeep
+                                                     : EliminationTree::MergeGreedy;
+    et.deepIterations = settings.deepSearchIterations;
   }
   timer.mark("etBuild");
   et.processTree(settings.findSparseEliminationRanges, noCrossPoints,
