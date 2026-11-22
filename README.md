@@ -168,11 +168,15 @@ BaSpaCho can use either the implementation in Eigen of AMD (by default), or the 
 AMD as part of SuiteSparse. Add `-DBASPACHO_USE_SUITESPARSE_AMD=1` to the build step to use the
 implementation in SuiteSparse instead of Eigen.
 
-## Benchmarking and fine-tuning
-BaSpaCho uses models of the timings of BLAS operations in order to decide on the best node merges
-selected by the supernodal algorithm. The trade-offs might change dramatically depending on the
-architecture, the number of cores, the BLAS implementation used and CPU vs GPU. Timings required
-to fit a model can be collected with the `bench` tool when provided the `-Z` command line argument.
+## Symbolic analysis and computation models
+The symbolic analysis (`createSolver`) groups the parameters into supernodes choosing the merges
+that minimize the factorization time estimated by a computation model of the dense operations.
+The trade-offs change a lot with the architecture, the BLAS library and the number of threads, so
+for the best results a model should be fitted on the target machine. How the analyses work, how
+the model is used, and how to fit one (`InitBench -collect`, `FitModel`) is explained in
+[doc/analysis.md](doc/analysis.md).
+
+## Benchmarking
 Here is a description of the benchmarking tools provided.
 
 ### `bench`
@@ -186,27 +190,22 @@ build/baspacho/benchmarking/bench -B 1_CHOLMOD
 (other operations are `analysis` and `solve-X` where X can be any number of right-hand sides).
 Running  with `-h` gives a view of all operations, solvers and problems available
 (and arguments accepting regular expressions in order to test a subselection of solvers/problems).
-When running default `factor` operation with `-Z` statistics are saved to files of the form
-`<config>_<op>.csv` where the `<config>` looks like `stats_cpu_f8` and discriminates the configuration,
-while `<op>` is one of the underlying blas-like operations used in factorization (ie one of `potrf`, `trsm`,
-`syge`, `asmbl`, where `syge` stands for `syrk/gemm` for people familiar with BLAS).
-The operations generated with a specific configuration (eg `cpu_f64`) can be processed as
-```
-build/baspacho/examples/opt_comp_model -p stats_cpu_f64_potrf.csv -a stats_cpu_f64_asmbl.csv 
-                                       -t stats_cpu_f64_trsm.csv -g stats_cpu_f64_syge.csv
-```
-on order to fit a computation model that can be provided as a setting to `createSolver` in order
-to fine-tune for your architecture.
+With `-Z` the timings of the factor operations are saved to files `stats_<config>.txt` (eg.
+`stats_cpu_f64.txt`), which `FitModel` can fit a computation model to (see
+[doc/analysis.md](doc/analysis.md)).
 
 ### `InitBench`
-Times the symbolic analysis (`createSolver`, with a breakdown of its phases) and checks factor and
-solve on BAL (`-bal`), g2o (`-g2o`), Matrix Market (`-mtx`) or synthetic grid (`-grid3d n bs`)
-problems, eg.
+Times the symbolic analysis (`createSolver`, with a breakdown of its phases with
+`BASPACHO_ANALYSIS_TIMINGS=1`) and checks factor and solve on BAL (`-bal`), g2o (`-g2o`), Matrix
+Market (`-mtx`) or synthetic (`-gen`, eg. `-gen grid3d:30:3`, see `-h`) problems, eg.
 ```
 build/baspacho/benchmarking/InitBench -bal ~/BAL/problem-871-527480-pre.txt -reps 3 -t 16
 ```
 It exits with an error if a solution is inaccurate (relative error above 1e-6) or not finite, so it
-can also be used as a numerical check.
+can also be used as a numerical check. It also compares analyses by the factorization time
+estimated by computation models without factoring (`-model cpu,file:model.txt -modes
+exact,fast,deep`), and collects the timings for fitting a model (`-collect`, see
+[doc/analysis.md](doc/analysis.md)).
 
 ### `BAL_bench`
 It's possible to benchmark on a bundle-adjustment problem from
@@ -227,7 +226,6 @@ A few examples are provided to illustrate what the library is capable of.
 and flavors of mixed direct/iterative solvers. The class is used in:
   - `OptimizeSimple.cpp`, solving a simple problem of points connected with springs
   - `OptimizeBaAtLarge.cpp`, solving a bundle adjustment problem from [Bundle Adjustment in the Large](https://grail.cs.washington.edu/projects/bal/)
-  - `OptimizeCompModel.cpp`, where a computation model params are fit to timings of BLAS operations.
 * `PCG_Sample.cpp` contains a demonstration of how it's possible to perform a partial elimination
 and complete the solution of a linear system iteratively using PCG.
 
