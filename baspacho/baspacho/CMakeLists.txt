@@ -2,6 +2,7 @@
 set(BaSpaCho_sources
     CoalescedBlockMatrix.cpp
     ComputationModel.cpp
+    ComputationModelFit.cpp
     EliminationTree.cpp
     FactorTimeEstimate.cpp
     MergeOptimizer.cpp

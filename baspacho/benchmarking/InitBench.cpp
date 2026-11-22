@@ -29,6 +29,7 @@
 #include <typeindex>
 #include <unordered_map>
 #include "baspacho/baspacho/ComputationModel.h"
+#include "baspacho/baspacho/ComputationModelFit.h"
 #include "baspacho/baspacho/FactorTimeEstimate.h"
 #include "baspacho/baspacho/MatOps.h"
 #include "baspacho/baspacho/Solver.h"
@@ -478,25 +479,17 @@ static pair<double, double> modelledFactorTime(const Solver& solver,
   return {e.supernodal, e.sparse};
 }
 
-// a model by name, or "file:path" with the 20 parameters (potrf 4, trsm 6, syge 6, asmbl 4),
-// optionally followed by the per-element asmbl parameter
+// a model by name, or "file:path" with its parameters (as written by FitModel -out)
 static const ComputationModel* namedModel(const string& name) {
   static map<string, unique_ptr<ComputationModel>> fromFiles;
   if (name.rfind("file:", 0) == 0) {
     auto& m = fromFiles[name];
     if (!m) {
       ifstream in(name.substr(5));
-      vector<double> v;
-      double x;
-      while (in >> x) v.push_back(x);
-      if (v.size() != 20 && v.size() != 21) {
-        throw runtime_error("model file " + name + ": expected 20 or 21 numbers");
-      }
-      m.reset(new ComputationModel(Eigen::Vector4d(v[0], v[1], v[2], v[3]),
-                                   Eigen::Map<Eigen::Matrix<double, 6, 1>>(&v[4]),
-                                   Eigen::Map<Eigen::Matrix<double, 6, 1>>(&v[10]),
-                                   Eigen::Vector4d(v[16], v[17], v[18], v[19]),
-                                   v.size() > 20 ? v[20] : 0.0));
+      if (!in) throw runtime_error("cannot read model file " + name.substr(5));
+      stringstream ss;
+      ss << in.rdbuf();
+      m.reset(new ComputationModel(parseComputationModelParams(ss.str())));
     }
     return m.get();
   }
@@ -610,22 +603,10 @@ static bool runBackend(const Problem& p, const Opts& o, BackendType backend, con
 
   vector<double> tFactor, tSolve;
   vector<double> factored;
-  FILE* collect = nullptr;
-  if (!o.collect.empty()) {
-    collect = fopen(o.collect.c_str(), "a");
-    auto& sym = solver->internalSymbolicContext();
-    sym.potrfStat.callBack = [=](double t, int, int n) {
-      fprintf(collect, "potrf %d %.9g\n", n, t);
-    };
-    sym.trsmStat.callBack = [=](double t, int, int n, int k) {
-      fprintf(collect, "trsm %d %d %.9g\n", n, k, t);
-    };
-    sym.sygeStat.callBack = [=](double t, int, int m, int n, int k) {
-      fprintf(collect, "syge %d %d %d %.9g\n", m, n, k, t);
-    };
-    sym.asmblStat.callBack = [=](double t, int, int br, int bc) {
-      fprintf(collect, "asmbl %d %d %.9g\n", br, bc, t);
-    };
+  bool collect = !o.collect.empty();
+  ComputationModelSamples samples;
+  if (collect) {
+    samples.collectFrom(*solver);
   }
   for (int r = 0; r < o.reps + 1; r++) {
     solver->enableStats(collect && r > 0);
@@ -667,7 +648,7 @@ static bool runBackend(const Problem& p, const Opts& o, BackendType backend, con
   double relErr = sqrt(err / nrm);
   if (collect) {
     solver->enableStats(false);
-    fclose(collect);
+    samples.save(o.collect);
   }
   double createWarm = minOf(vector<double>(tCreate.begin() + 1, tCreate.end()));
   if (!o.cm.empty()) {
@@ -711,7 +692,7 @@ static void help() {
        << "  -analysis a   fast, exact or deep (default auto)\n"
        << "  -modes list   analyses compared by -model (default exact,fast)\n"
        << "  -deepIters n  rounds of local search of the deep analysis\n"
-       << "  -collect f    append the timings of the factor operations to f\n"
+       << "  -collect f    append the timings of the factor operations to f (input of FitModel)\n"
        << "  -maxbs n      max detected block size for -mtx (default 16)\n";
 }
 

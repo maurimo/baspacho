@@ -13,6 +13,7 @@
 #include <random>
 #include <regex>
 #include "baspacho/baspacho/DebugMacros.h"
+#include "baspacho/baspacho/ComputationModelFit.h"
 #include "baspacho/baspacho/Solver.h"
 #include "baspacho/testing/TestingMatGen.h"
 #include "baspacho/testing/TestingUtils.h"
@@ -64,62 +65,16 @@ void bangGpu() {
 }
 #endif
 
-unordered_map<string, vector<tuple<int, double>>> potrfStats;
-unordered_map<string, vector<tuple<int, int, double>>> trsmStats;
-unordered_map<string, vector<tuple<int, int, int, double>>> sygeStats;
-unordered_map<string, vector<tuple<int, int, double>>> asmblStats;
+// timings of the factor operations by configuration (-Z), input of FitModel
+unordered_map<string, ComputationModelSamples> opSamples;
 
 void registerCallbacks(Solver& solver, const string& config) {
-  vector<tuple<int, double>>& currPotrfStats = potrfStats[config];
-  vector<tuple<int, int, double>>& currTrsmStats = trsmStats[config];
-  vector<tuple<int, int, int, double>>& currSygeStats = sygeStats[config];
-  vector<tuple<int, int, double>>& currAsmblStats = asmblStats[config];
-
-  solver.internalSymbolicContext().potrfStat.callBack = [&](double time, int dataSize, int n) {
-    currPotrfStats.emplace_back(n, time);
-  };
-  solver.internalSymbolicContext().trsmStat.callBack = [&](double time, int dataSize, int n,
-                                                           int k) {
-    currTrsmStats.emplace_back(n, k, time);  //
-  };
-  solver.internalSymbolicContext().sygeStat.callBack = [&](double time, int dataSize, int m, int n,
-                                                           int k) {
-    currSygeStats.emplace_back(m, n, k, time);
-  };
-  solver.internalSymbolicContext().asmblStat.callBack = [&](double time, int dataSize, int br,
-                                                            int bc) {
-    currAsmblStats.emplace_back(br, bc, time);  //
-  };
+  opSamples[config].collectFrom(solver);
 }
 
 void saveAllStats() {
-  for (auto [config, stats] : potrfStats) {
-    ofstream out("stats_" + config + "_potrf.csv");
-    out.precision(numeric_limits<double>::max_digits10 + 2);
-    for (auto [n, t] : stats) {
-      out << n << "\t" << t << "\n";
-    }
-  }
-  for (auto [config, stats] : trsmStats) {
-    ofstream out("stats_" + config + "_trsm.csv");
-    out.precision(numeric_limits<double>::max_digits10 + 2);
-    for (auto [n, k, t] : stats) {
-      out << n << "\t" << k << "\t" << t << "\n";
-    }
-  }
-  for (auto [config, stats] : sygeStats) {
-    ofstream out("stats_" + config + "_syge.csv");
-    out.precision(numeric_limits<double>::max_digits10 + 2);
-    for (auto [m, n, k, t] : stats) {
-      out << m << "\t" << n << "\t" << k << "\t" << t << "\n";
-    }
-  }
-  for (auto [config, stats] : asmblStats) {
-    ofstream out("stats_" + config + "_asmbl.csv");
-    out.precision(numeric_limits<double>::max_digits10 + 2);
-    for (auto [r, c, t] : stats) {
-      out << r << "\t" << c << "\t" << t << "\n";
-    }
+  for (auto& [config, samples] : opSamples) {
+    samples.save("stats_" + config + ".txt", /* append = */ false);
   }
 }
 
@@ -576,7 +531,8 @@ void help() {
        << "\n -X regex     regex for e[X]cluding problem types"
        << "\n -B solver    solver selected as [B]baseline"
        << "\n -O ops       comma-sep list of operations (default: factor)"
-       << "\n -Z           save stats on blas operations in CVS files" << endl;
+       << "\n -Z           save the timings of the factor operations (stats_<config>.txt, FitModel)"
+       << endl;
 
   cout << "\nOperations:" << endl;
   for (const auto& [label, desc] : timingLabels) {

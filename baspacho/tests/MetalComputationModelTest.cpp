@@ -10,14 +10,11 @@
 // factor operation (potrf, trsm, syrk/gemm, assemble) as its GPU execution time, run alone in its
 // command buffer. The operations of the factorization of a few problems are collected, the fixed
 // cost of a command buffer (measured on trivial operations) is subtracted, since in a normal
-// factorization the operations share command buffers, and the parameters of each model are
-// fitted by non-negative least squares on the relative errors (non-negative coefficients keep
-// the estimates positive and increasing in every size, also outside the range of the samples:
-// the merges chosen by the analysis must not exploit the artifacts of a fit). The parameters are
-// printed in the format of ComputationModel.cpp, followed by the error of the fit.
+// factorization the operations share command buffers, and the model is fitted by
+// fitComputationModel (non-negative least squares on the relative errors, see doc/analysis.md).
+// The parameters are printed in the format of ComputationModel.cpp, with the errors of the fit.
 
 #include <gtest/gtest.h>
-#include <Eigen/Dense>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -25,6 +22,7 @@
 #include <utility>
 #include <vector>
 #include "baspacho/baspacho/ComputationModel.h"
+#include "baspacho/baspacho/ComputationModelFit.h"
 #include "baspacho/baspacho/MetalDefs.h"
 #include "baspacho/baspacho/Solver.h"
 #include "baspacho/baspacho/SparseStructure.h"
@@ -99,30 +97,14 @@ Problem ba(int64_t nCams, int64_t nPts, int64_t camSize) {
   return Problem{sizes, lowerCsr(nPts + nCams, pairs)};
 }
 
-struct Samples {
-  vector<pair<double, double>> potrf;                 // n, t
-  vector<pair<Eigen::Vector2d, double>> trsm, asmbl;  // (n, k) / (br, bc), t
-  vector<pair<Eigen::Vector3d, double>> syge;         // (m, n, k), t
-};
-
 // factors `prob` on Metal with the stats enabled, collecting the operation timings
-void collect(const Problem& prob, Samples& samples, int reps,
+void collect(const Problem& prob, ComputationModelSamples& samples, int reps,
              AnalysisMode analysis = AnalysisAuto) {
   Settings settings;
   settings.backend = BackendMetal;
   settings.analysis = analysis;
   SolverPtr solver = createSolver(settings, prob.paramSize, prob.ss);
-  SymbolicCtx& sym = solver->internalSymbolicContext();
-  sym.potrfStat.callBack = [&](double t, int, int n) { samples.potrf.emplace_back(n, t); };
-  sym.trsmStat.callBack = [&](double t, int, int n, int k) {
-    samples.trsm.emplace_back(Eigen::Vector2d(n, k), t);
-  };
-  sym.sygeStat.callBack = [&](double t, int, int m, int n, int k) {
-    samples.syge.emplace_back(Eigen::Vector3d(m, n, k), t);
-  };
-  sym.asmblStat.callBack = [&](double t, int, int br, int bc) {
-    samples.asmbl.emplace_back(Eigen::Vector2d(br, bc), t);
-  };
+  samples.collectFrom(*solver);
   solver->enableStats(true);
   // positive definite data: random off-diagonal blocks, dominant diagonal
   vector<float> data(solver->dataSize(), 0.0f);
@@ -148,110 +130,25 @@ void collect(const Problem& prob, Samples& samples, int reps,
   }
 }
 
-// non-negative least squares (Lawson-Hanson active set): min |A x - b|, x >= 0
-Eigen::VectorXd nnls(const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
-  int64_t n = A.cols();
-  Eigen::VectorXd x = Eigen::VectorXd::Zero(n);
-  vector<bool> passive(n, false);
-  auto lsOnPassive = [&]() {
-    vector<int64_t> idx;
-    for (int64_t j = 0; j < n; j++) {
-      if (passive[j]) idx.push_back(j);
-    }
-    Eigen::MatrixXd Ap(A.rows(), idx.size());
-    for (size_t q = 0; q < idx.size(); q++) Ap.col(q) = A.col(idx[q]);
-    Eigen::VectorXd zp = Ap.colPivHouseholderQr().solve(b);
-    Eigen::VectorXd z = Eigen::VectorXd::Zero(n);
-    for (size_t q = 0; q < idx.size(); q++) z[idx[q]] = zp[q];
-    return z;
-  };
-  for (int iter = 0; iter < 3 * n; iter++) {
-    Eigen::VectorXd w = A.transpose() * (b - A * x);
-    int64_t best = -1;
-    for (int64_t j = 0; j < n; j++) {
-      if (!passive[j] && w[j] > 1e-12 * b.norm() && (best == -1 || w[j] > w[best])) best = j;
-    }
-    if (best == -1) break;
-    passive[best] = true;
-    while (true) {
-      Eigen::VectorXd z = lsOnPassive();
-      bool allPos = true;
-      double alpha = 1.0;
-      for (int64_t j = 0; j < n; j++) {
-        if (passive[j] && z[j] <= 0) {
-          allPos = false;
-          alpha = min(alpha, x[j] / (x[j] - z[j]));
-        }
-      }
-      if (allPos) {
-        x = z;
-        break;
-      }
-      x += alpha * (z - x);
-      for (int64_t j = 0; j < n; j++) {
-        if (passive[j] && x[j] <= 1e-15) {
-          passive[j] = false;
-          x[j] = 0;
-        }
-      }
-    }
-  }
-  return x;
-}
-
-// non-negative least squares on the relative errors: min sum_i ((f_i . x - t_i) / t_i)^2,
-// x >= 0 (columns scaled for the conditioning)
-template <int N>
-Eigen::Matrix<double, N, 1> fitRelative(const vector<Eigen::Matrix<double, N, 1>>& features,
-                                        const vector<double>& times) {
-  Eigen::MatrixXd A(features.size(), N);
-  Eigen::VectorXd b = Eigen::VectorXd::Ones(features.size());
-  for (size_t i = 0; i < features.size(); i++) {
-    A.row(i) = features[i].transpose() / times[i];
-  }
-  Eigen::VectorXd scale = A.colwise().norm().transpose().cwiseMax(1e-300);
-  for (int j = 0; j < N; j++) A.col(j) /= scale[j];
-  Eigen::VectorXd x = nnls(A, b);
-  return x.cwiseQuotient(scale);
-}
-
 double median(vector<double> v) {
   sort(v.begin(), v.end());
   return v.empty() ? 0 : v[v.size() / 2];
-}
-
-template <typename Pred>
-double medianRelErr(size_t n, Pred&& predAndTime) {
-  vector<double> errs;
-  for (size_t i = 0; i < n; i++) {
-    auto [pred, t] = predAndTime(i);
-    errs.push_back(fabs(pred - t) / t);
-  }
-  return median(errs);
-}
-
-void printVec(const char* what, const Eigen::VectorXd& v) {
-  printf("    {");
-  for (int i = 0; i < v.size(); i++) {
-    printf("%s%.18e", i ? ", " : "", v[i]);
-  }
-  printf("},  // %s\n", what);
 }
 
 }  // namespace
 
 TEST(MetalComputationModel, Fit) {
   // fixed cost of a command buffer: potrf of a 1x1 block, alone
-  Samples trivial;
+  ComputationModelSamples trivial;
   collect(Problem{{1}, lowerCsr(1, {})}, trivial, 30);
   ASSERT_GE(trivial.potrf.size(), 30u);
   vector<double> trivialTimes;
-  for (auto& [n, t] : trivial.potrf) trivialTimes.push_back(t);
+  for (auto& p : trivial.potrf) trivialTimes.push_back(p[1]);
   double overhead = median(trivialTimes);
 
   // small and large operations: grids with both analyses (the exact one makes large nodes),
   // a larger grid (large separators), bundle adjustment
-  Samples s;
+  ComputationModelSamples s;
   for (int64_t bs : {1, 2, 3, 6}) {
     for (AnalysisMode an : {AnalysisFast, AnalysisExact}) {
       collect(grid3d(bs <= 2 ? 12 : 9, bs), s, 1, an);
@@ -269,80 +166,35 @@ TEST(MetalComputationModel, Fit) {
 
   // operation times without the command buffer overhead (at least 5% of the measured time)
   auto net = [&](double t) { return max(t - overhead, 0.05 * t); };
-  vector<Eigen::Vector4d> fp, fa;
-  vector<Eigen::Matrix<double, 6, 1>> ft, fs;
-  vector<double> tp, tt, ts, ta;
-  for (auto& [n, t] : s.potrf) {
-    fp.push_back(Eigen::Vector4d(1, n, n * n, n * n * n));
-    tp.push_back(net(t));
-  }
-  for (auto& [nk, t] : s.trsm) {
-    double n = nk[0], k = nk[1];
-    Eigen::Matrix<double, 6, 1> f;
-    f << 1, n, n * n, k, k * n, k * n * n;
-    ft.push_back(f);
-    tt.push_back(net(t));
-  }
-  for (auto& [mnk, t] : s.syge) {
-    double m = mnk[0], n = mnk[1], k = mnk[2];
-    Eigen::Matrix<double, 6, 1> f;
-    f << 1, m + n, m * n, k, k * (m + n), k * m * n;
-    fs.push_back(f);
-    ts.push_back(net(t));
-  }
-  for (auto& [rc, t] : s.asmbl) {
-    double br = rc[0], bc = rc[1];
-    fa.push_back(Eigen::Vector4d(1, br, bc, br * bc));
-    ta.push_back(net(t));
-  }
-  Eigen::Vector4d pPotrf = fitRelative<4>(fp, tp), pAsmbl = fitRelative<4>(fa, ta);
-  Eigen::Matrix<double, 6, 1> pTrsm = fitRelative<6>(ft, tt), pSyge = fitRelative<6>(fs, ts);
-  ComputationModel model(pPotrf, pTrsm, pSyge, pAsmbl);
+  for (auto& x : s.potrf) x.back() = net(x.back());
+  for (auto& x : s.trsm) x.back() = net(x.back());
+  for (auto& x : s.syge) x.back() = net(x.back());
+  for (auto& x : s.asmbl) x.back() = net(x.back());
 
-  printf("metal model (ComputationModel.cpp format):\n");
-  printVec("potrf", pPotrf);
-  printVec("trsm", pTrsm);
-  printVec("syge", pSyge);
-  printVec("asmbl", pAsmbl);
-
-  double ePotrf = medianRelErr(fp.size(), [&](size_t i) {
-    return make_pair(model.potrfEst(s.potrf[i].first), tp[i]);
-  });
-  double eTrsm = medianRelErr(ft.size(), [&](size_t i) {
-    return make_pair(model.trsmEst(s.trsm[i].first[0], s.trsm[i].first[1]), tt[i]);
-  });
-  double eSyge = medianRelErr(fs.size(), [&](size_t i) {
-    auto& v = s.syge[i].first;
-    return make_pair(model.sygeEst(v[0], v[1], v[2]), ts[i]);
-  });
-  double eAsmbl = medianRelErr(fa.size(), [&](size_t i) {
-    return make_pair(model.asmblEst(s.asmbl[i].first[0], s.asmbl[i].first[1]), ta[i]);
-  });
-  printf("metal model fit, median relative error: potrf %.2f, trsm %.2f, syge %.2f, asmbl %.2f\n",
-         ePotrf, eTrsm, eSyge, eAsmbl);
-  double maxN = 0, maxK = 0;
-  for (auto& [mnk, t] : s.syge) {
-    maxN = max(maxN, mnk[1]);
-    maxK = max(maxK, mnk[2]);
+  ComputationModelFitStats stats[4];
+  ComputationModel model = fitComputationModel(s, false, 4.0, 4, stats);
+  printf("metal model (ComputationModel.cpp format):\n%s\n", formatComputationModel(model).c_str());
+  printf("metal model parameters: %s\n", computationModelParams(model).c_str());
+  const char* names[4] = {"potrf", "trsm", "syge", "asmbl"};
+  for (int i = 0; i < 4; i++) {
+    printf("metal model fit %s: %lld samples, %lld kept, median relative error %.2f, "
+           "estimated/measured total %.2f\n",
+           names[i], (long long)stats[i].samples, (long long)stats[i].kept, stats[i].medianRelErr,
+           stats[i].totalRatio);
+    // loose bound: the paravirtual GPU of the CI runners is noisy
+    EXPECT_LT(stats[i].medianRelErr, 1.0);
   }
-  printf("metal model samples range: syge n up to %.0f, k up to %.0f; GFlop/s syge(m=n=k): "
-         "128 %.1f, 512 %.1f, 2048 %.1f; potrf: 128 %.1f, 512 %.1f, 2048 %.1f\n",
-         maxN, maxK, 2 * pow(128, 3) / model.sygeEst(128, 128, 128) * 1e-9,
+  printf("metal model GFlop/s syge(m=n=k): 128 %.1f, 512 %.1f, 2048 %.1f; potrf: 128 %.1f, "
+         "512 %.1f, 2048 %.1f\n",
+         2 * pow(128, 3) / model.sygeEst(128, 128, 128) * 1e-9,
          2 * pow(512, 3) / model.sygeEst(512, 512, 512) * 1e-9,
          2 * pow(2048, 3) / model.sygeEst(2048, 2048, 2048) * 1e-9,
          pow(128, 3) / 3 / model.potrfEst(128) * 1e-9, pow(512, 3) / 3 / model.potrfEst(512) * 1e-9,
          pow(2048, 3) / 3 / model.potrfEst(2048) * 1e-9);
-
-  for (double p : {pPotrf.norm(), pTrsm.norm(), pSyge.norm(), pAsmbl.norm()}) {
+  for (double p : {model.potrfParams.minCoeff(), model.trsmParams.minCoeff(),
+                   model.sygeParams.minCoeff(), model.asmblParams.minCoeff(),
+                   model.asmblElemParam}) {
     EXPECT_TRUE(std::isfinite(p));
+    EXPECT_GE(p, 0.0);
   }
-  EXPECT_GE(pPotrf.minCoeff(), 0.0);
-  EXPECT_GE(pTrsm.minCoeff(), 0.0);
-  EXPECT_GE(pSyge.minCoeff(), 0.0);
-  EXPECT_GE(pAsmbl.minCoeff(), 0.0);
-  // loose bounds: the paravirtual GPU of the CI runners is noisy
-  EXPECT_LT(ePotrf, 1.0);
-  EXPECT_LT(eTrsm, 1.0);
-  EXPECT_LT(eSyge, 1.0);
-  EXPECT_LT(eAsmbl, 1.0);
 }

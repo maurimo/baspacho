@@ -23,12 +23,3 @@ set(opt_simple_sources
 
 add_executable(opt_simple ${opt_simple_sources})
 target_link_libraries (opt_simple ${BASPACHO_LIBRARY})
-
-
-set(opt_comp_model_sources 
-    PCG.cpp
-    Utils.cpp
-    OptimizeCompModel.cpp)
-
-add_executable(opt_comp_model ${opt_comp_model_sources})
-target_link_libraries (opt_comp_model ${BASPACHO_LIBRARY} testing)
