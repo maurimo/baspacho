@@ -15,6 +15,8 @@
 // check is run to verify correctness.
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <chrono>
 #include <cstring>
 #include <fstream>
@@ -204,6 +206,171 @@ static Problem makeGrid3d(int64_t n, int64_t bs) {
   prob.ss = lowerCsrFromPairs(n * n * n, pairs);
   prob.name = "grid3d_" + to_string(n) + "_bs" + to_string(bs);
   return prob;
+}
+
+// Synthetic problems, spec "type:arg:arg...":
+//  grid2d:n:bs                 n x n grid, 9-point stencil
+//  grid3d:n:bs                 n^3 grid, 27-point stencil
+//  knn2d:N:k:bs, knn3d:N:k:bs  N random points in the unit square/cube, each connected to its
+//                              k nearest neighbors (mesh-like)
+//  ba:cams:pts:obs:win:cs      bundle adjustment with locality: cameras on a trajectory (odometry
+//                              between consecutive ones), each point seen by `obs` cameras within
+//                              `win` of a random camera; points (size 3) first, cameras (size cs)
+//  slam:poses:loops:bs         pose graph: 2D random walk on a lattice, odometry chain, up to
+//                              `loops` loop closures per pose with earlier poses in the same cell
+//  powerlaw:N:m:bs             Barabasi-Albert preferential attachment, m edges per node
+//  banded:N:bw:extra:bs        band of half-width bw plus `extra` random long-range edges
+//  er:N:deg:bs                 Erdos-Renyi, average degree deg
+static Problem makeGenerated(const string& spec) {
+  vector<string> a;
+  {
+    stringstream ss(spec);
+    string t;
+    while (getline(ss, t, ':')) a.push_back(t);
+  }
+  auto arg = [&](size_t i) -> int64_t {
+    if (i >= a.size()) throw runtime_error("missing argument " + to_string(i) + " in " + spec);
+    int64_t v = stoll(a[i]);
+    if (v <= 0) throw runtime_error("arguments must be positive in " + spec);
+    return v;
+  };
+  const string& type = a.at(0);
+  mt19937_64 gen(12345);
+  vector<pair<int64_t, int64_t>> pairs;
+  Problem prob;
+  prob.name = spec;
+  auto finish = [&](int64_t n, int64_t bs) {
+    prob.paramSize.assign(n, bs);
+    prob.ss = lowerCsrFromPairs(n, pairs);
+    return prob;
+  };
+  if (type == "grid2d") {
+    int64_t n = arg(1), bs = arg(2);
+    for (int64_t x = 0; x < n; x++)
+      for (int64_t y = 0; y < n; y++)
+        for (int64_t dx = 0; dx <= 1; dx++)
+          for (int64_t dy = -1; dy <= 1; dy++) {
+            if (dx == 0 && dy <= 0) continue;
+            int64_t X = x + dx, Y = y + dy;
+            if (X < n && Y >= 0 && Y < n) pairs.emplace_back(X * n + Y, x * n + y);
+          }
+    return finish(n * n, bs);
+  }
+  if (type == "grid3d") {
+    Problem p = makeGrid3d(arg(1), arg(2));
+    p.name = spec;
+    return p;
+  }
+  if (type == "knn2d" || type == "knn3d") {
+    int dim = type == "knn2d" ? 2 : 3;
+    int64_t N = arg(1), k = arg(2), bs = arg(3);
+    uniform_real_distribution<double> u(0, 1);
+    vector<array<double, 3>> pts(N);
+    for (auto& p : pts) p = {u(gen), u(gen), dim == 3 ? u(gen) : 0.0};
+    // bucket grid with ~2 points per cell
+    int64_t cells = max<int64_t>(1, (int64_t)pow(N / 2.0, 1.0 / dim));
+    auto cellOf = [&](double v) { return min<int64_t>(cells - 1, (int64_t)(v * cells)); };
+    auto key = [&](int64_t cx, int64_t cy, int64_t cz) { return (cz * cells + cy) * cells + cx; };
+    int64_t numCells = dim == 3 ? cells * cells * cells : cells * cells;
+    vector<vector<int64_t>> bucket(numCells);
+    for (int64_t i = 0; i < N; i++)
+      bucket[key(cellOf(pts[i][0]), cellOf(pts[i][1]), dim == 3 ? cellOf(pts[i][2]) : 0)]
+          .push_back(i);
+    for (int64_t i = 0; i < N; i++) {
+      int64_t cx = cellOf(pts[i][0]), cy = cellOf(pts[i][1]), cz = dim == 3 ? cellOf(pts[i][2]) : 0;
+      vector<pair<double, int64_t>> cand;
+      for (int64_t r = 1; (int64_t)cand.size() < k + 1 && r <= cells; r++) {
+        cand.clear();
+        for (int64_t z = (dim == 3 ? cz - r : 0); z <= (dim == 3 ? cz + r : 0); z++)
+          for (int64_t y = cy - r; y <= cy + r; y++)
+            for (int64_t x = cx - r; x <= cx + r; x++) {
+              if (x < 0 || y < 0 || z < 0 || x >= cells || y >= cells || z >= cells) continue;
+              for (int64_t j : bucket[key(x, y, z)]) {
+                double d = 0;
+                for (int c = 0; c < 3; c++) d += (pts[i][c] - pts[j][c]) * (pts[i][c] - pts[j][c]);
+                cand.emplace_back(d, j);
+              }
+            }
+      }
+      int64_t m = min<int64_t>(k + 1, cand.size());
+      partial_sort(cand.begin(), cand.begin() + m, cand.end());
+      for (int64_t q = 0; q < m; q++)
+        if (cand[q].second != i) pairs.emplace_back(i, cand[q].second);
+    }
+    return finish(N, bs);
+  }
+  if (type == "ba") {
+    int64_t cams = arg(1), npts = arg(2), obs = arg(3), win = arg(4), cs = arg(5);
+    uniform_int_distribution<int64_t> camDist(0, cams - 1), offDist(-win, win);
+    for (int64_t p = 0; p < npts; p++) {
+      int64_t c0 = camDist(gen);
+      for (int64_t o = 0; o < obs; o++) {
+        int64_t c = min(cams - 1, max<int64_t>(0, c0 + offDist(gen)));
+        pairs.emplace_back(npts + c, p);
+      }
+    }
+    for (int64_t c = 0; c + 1 < cams; c++) pairs.emplace_back(npts + c + 1, npts + c);
+    prob.paramSize.assign(npts, 3);
+    prob.paramSize.resize(npts + cams, cs);
+    prob.ss = lowerCsrFromPairs(npts + cams, pairs);
+    prob.numElim = npts;
+    return prob;
+  }
+  if (type == "slam") {
+    int64_t poses = arg(1), loops = arg(2), bs = arg(3);
+    uniform_int_distribution<int> dir(0, 3);
+    map<pair<int64_t, int64_t>, vector<int64_t>> visits;
+    int64_t x = 0, y = 0;
+    for (int64_t i = 0; i < poses; i++) {
+      if (i > 0) pairs.emplace_back(i, i - 1);
+      auto& v = visits[{x, y}];
+      int64_t added = 0;
+      for (auto it = v.rbegin(); it != v.rend() && added < loops; ++it)
+        if (*it < i - 2) pairs.emplace_back(i, *it), added++;
+      v.push_back(i);
+      int d = dir(gen);
+      x += d == 0 ? 1 : d == 1 ? -1 : 0;
+      y += d == 2 ? 1 : d == 3 ? -1 : 0;
+    }
+    return finish(poses, bs);
+  }
+  if (type == "powerlaw") {
+    int64_t N = arg(1), m = arg(2), bs = arg(3);
+    vector<int64_t> targets;  // nodes repeated by degree
+    for (int64_t i = 0; i < N; i++) {
+      for (int64_t e = 0; e < m && i > 0; e++) {
+        int64_t j = targets.empty() ? 0 : targets[uniform_int_distribution<int64_t>(
+                                              0, targets.size() - 1)(gen)];
+        if (j == i) continue;
+        pairs.emplace_back(i, j);
+        targets.push_back(j);
+        targets.push_back(i);
+      }
+      if (i == 0) targets.push_back(0);
+    }
+    return finish(N, bs);
+  }
+  if (type == "banded") {
+    int64_t N = arg(1), bw = arg(2), extra = arg(3), bs = arg(4);
+    for (int64_t i = 0; i < N; i++)
+      for (int64_t j = max<int64_t>(0, i - bw); j < i; j++) pairs.emplace_back(i, j);
+    uniform_int_distribution<int64_t> nd(0, N - 1);
+    for (int64_t e = 0; e < extra; e++) {
+      int64_t i = nd(gen), j = nd(gen);
+      if (i != j) pairs.emplace_back(i, j);
+    }
+    return finish(N, bs);
+  }
+  if (type == "er") {
+    int64_t N = arg(1), deg = arg(2), bs = arg(3);
+    uniform_int_distribution<int64_t> nd(0, N - 1);
+    for (int64_t e = 0; e < N * deg / 2; e++) {
+      int64_t i = nd(gen), j = nd(gen);
+      if (i != j) pairs.emplace_back(i, j);
+    }
+    return finish(N, bs);
+  }
+  throw runtime_error("unknown generator " + type);
 }
 
 // fill input blocks of A with random values making it diagonally dominant
@@ -399,6 +566,7 @@ static void help() {
        << "  -noGivenElim  for BAL, don't pass the points as a given elimination range\n"
        << "  -noAutoElim   disable automatic detection of sparse elimination ranges\n"
        << "  -grid3d n bs  synthetic n^3 grid, block size bs, 27-point stencil\n"
+       << "  -gen spec     synthetic problem, see makeGenerated (eg. knn3d:20000:8:3)\n"
        << "  -maxbs n      max detected block size for -mtx (default 16)\n";
 }
 
@@ -406,6 +574,7 @@ static int run(int argc, char* argv[]) {
   Opts o;
   string bal, g2o, mtx, name;
   int64_t gridN = 0, gridBs = 3;
+  string genSpec;
   int maxbs = 16;
   for (int i = 1; i < argc; i++) {
     string a = argv[i];
@@ -417,6 +586,7 @@ static int run(int argc, char* argv[]) {
     else if (a == "-g2o") g2o = next();
     else if (a == "-mtx") mtx = next();
     else if (a == "-grid3d") gridN = stoi(next()), gridBs = stoi(next());
+    else if (a == "-gen") genSpec = next();
     else if (a == "-name") name = next();
     else if (a == "-reps") o.reps = stoi(next());
     else if (a == "-t") o.numThreads = stoi(next());
@@ -442,6 +612,7 @@ static int run(int argc, char* argv[]) {
   else if (!g2o.empty()) p = loadG2o(g2o), p.name = g2o;
   else if (!mtx.empty()) p = loadMtx(mtx, maxbs), p.name = mtx;
   else if (gridN > 0) p = makeGrid3d(gridN, gridBs);
+  else if (!genSpec.empty()) p = makeGenerated(genSpec);
   else {
     help();
     return 1;
