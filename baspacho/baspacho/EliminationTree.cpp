@@ -300,7 +300,8 @@ void EliminationTree::computeMergesFast() {
     double sk = nodeSize[k], sp = nodeSize[p], sm = sk + sp;
     double z = zeros[k] + zeros[p] + sk * std::max(0.0, (double)(nodeRows[p] + sp - nodeRows[k]));
     double frac = z / (sm * (sm + 1) / 2 + sm * nodeRows[p]);
-    bool willMerge = z == 0 || (!fundamentalOnly && sm <= kRelaxSize[0]) ||
+    bool willMerge = (z == 0 && (!fundamentalOnly || sm <= fundamentalMaxSize)) ||
+                     (!fundamentalOnly && sm <= kRelaxSize[0]) ||
                      (!fundamentalOnly && ((sm <= kRelaxSize[1] && frac < kRelaxZeros[0]) ||
                                            (sm <= kRelaxSize[2] && frac < kRelaxZeros[1]) ||
                                            frac < kRelaxZeros[2]));
@@ -667,6 +668,7 @@ static vector<int64_t> currentPartition(EliminationTree& et) {
 vector<int64_t> EliminationTree::partitionFast(bool fundamental) {
   nodeSize = paramSize;
   fundamentalOnly = fundamental;
+  fundamentalMaxSize = getenv("BASPACHO_FUNDCAP") ? atof(getenv("BASPACHO_FUNDCAP")) : 1e30;
   computeMergesFast();
   fundamentalOnly = false;
   auto r = currentPartition(*this);

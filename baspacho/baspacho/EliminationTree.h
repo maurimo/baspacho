@@ -61,6 +61,7 @@ struct EliminationTree {
 
   bool fastSymbolic = false;  // set by buildTreeFast
   bool fundamentalOnly = false;  // computeMergesFast: only merges adding no explicit zeros
+  double fundamentalMaxSize = 1e30;  // ... and only up to this size (scalar columns)
 
   // (research) merges chosen by MergeOptimizer with the exact cost model, on top of a coarse
   // partition ("none": spans, "fund": fundamental supernodes, "relax": relaxed amalgamation)
