@@ -16,6 +16,10 @@
 
 #include <dispenso/parallel_for.h>
 #include <algorithm>
+#include <cstdint>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 #include "baspacho/baspacho/DebugMacros.h"
 #include "baspacho/baspacho/Utils.h"
 
@@ -160,6 +164,16 @@ SparseStructure SparseStructure::symmetricPermutation(const std::vector<int64_t>
   return retv;
 }
 
+static inline int64_t countTrailingZeros(uint64_t x) {  // x != 0
+#if defined(_MSC_VER)
+  unsigned long i;
+  _BitScanForward64(&i, x);
+  return i;
+#else
+  return __builtin_ctzll(x);
+#endif
+}
+
 SparseStructure SparseStructure::addIndependentEliminationFill(int64_t elimStart, int64_t elimEnd,
                                                                bool sortIdx) const {
   int64_t ord = order();
@@ -208,8 +222,27 @@ SparseStructure SparseStructure::addIndependentEliminationFill(int64_t elimStart
     int64_t d = elimPtrs[c + 1] - elimPtrs[c];
     numPairs += d * (d - 1) / 2;
   }
+  // With few rows (eg. the cameras of a BA problem) the pairs are set in a bitmap of rows x rows
+  // (no duplicates, fits in cache), else they are collected in per-row buckets if they fit in
+  // memory, else each row walks the columns of its eliminated entries
+  constexpr int64_t kMaxBitmapRows = 16384;              // up to 32MB
   constexpr int64_t kMaxBucketPairs = int64_t(1) << 26;  // 256MB of int32 entries
-  const bool buckets = numPairs <= kMaxBucketPairs && numRows0 < (int64_t(1) << 31);
+  const bool bitmap = numRows0 <= kMaxBitmapRows;
+  const bool buckets = !bitmap && numPairs <= kMaxBucketPairs && numRows0 < (int64_t(1) << 31);
+  const int64_t bitmapWords = (numRows0 + 63) / 64;
+  vector<uint64_t> pairBits;
+  if (bitmap) {
+    pairBits.assign(numRows0 * bitmapWords, 0);
+    for (int64_t c = 0; c < numElim; c++) {
+      for (int64_t b = elimPtrs[c] + 1; b < elimPtrs[c + 1]; b++) {
+        uint64_t* row = pairBits.data() + (elimRows[b] - elimEnd) * bitmapWords;
+        for (int64_t a = elimPtrs[c]; a < b; a++) {
+          int64_t w = elimRows[a] - elimEnd;
+          row[w >> 6] |= uint64_t(1) << (w & 63);
+        }
+      }
+    }
+  }
   vector<int64_t> fillPtr;
   vector<int32_t> fillRows;  // relative to elimEnd
   if (buckets) {
@@ -268,7 +301,17 @@ SparseStructure SparseStructure::addIndependentEliminationFill(int64_t elimStart
               std::sort(low.begin(), low.end());
               low.erase(std::unique(low.begin(), low.end()), low.end());
             }
-            if (buckets) {
+            if (bitmap) {
+              out.insert(out.end(), low.begin(), low.end());
+              const uint64_t* row = pairBits.data() + (k - elimEnd) * bitmapWords;
+              for (int64_t wd = 0; wd < bitmapWords; wd++) {
+                for (uint64_t bits = row[wd]; bits; bits &= bits - 1) {
+                  int64_t w = elimEnd + wd * 64 + countTrailingZeros(bits);
+                  tags[w - elimEnd] = k;
+                  high.push_back(w);
+                }
+              }
+            } else if (buckets) {
               out.insert(out.end(), low.begin(), low.end());
               for (int64_t q = fillPtr[k - elimEnd], qEnd = fillPtr[k - elimEnd + 1]; q < qEnd;
                    q++) {
@@ -279,7 +322,7 @@ SparseStructure SparseStructure::addIndependentEliminationFill(int64_t elimStart
                 }
               }
             }
-            for (int64_t i : buckets ? std::vector<int64_t>() : low) {
+            for (int64_t i : (bitmap || buckets) ? std::vector<int64_t>() : low) {
               out.push_back(i);
               if (i >= elimStart) {  // walk rows of elim column i, below k
                 for (int64_t t = elimPtrs[i - elimStart], tEnd = elimPtrs[i - elimStart + 1];
