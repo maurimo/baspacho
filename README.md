@@ -2,6 +2,12 @@
     <a href="https://dl.circleci.com/status-badge/redirect/gh/facebookresearch/baspacho/tree/main">
         <img src="https://dl.circleci.com/status-badge/img/gh/facebookresearch/baspacho/tree/main.svg?style=svg&circle-token=a463b80560b6b9db75f7810a171f3c65e8dcad7b" alt="CircleCI" height="20">
     </a>
+    <a href="https://github.com/maurimo/baspacho/actions/workflows/ci.yml">
+        <img src="https://github.com/maurimo/baspacho/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" height="20">
+    </a>
+    <a href="https://github.com/maurimo/baspacho/actions/workflows/metal.yml">
+        <img src="https://github.com/maurimo/baspacho/actions/workflows/metal.yml/badge.svg?branch=main" alt="Metal" height="20">
+    </a>
     <a href="https://github.com/facebookresearch/baspacho/blob/main/LICENSE">
         <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" height="20">
     </a>
@@ -125,6 +131,10 @@ rhsGpu.get(rhs);  // waits for the GPU and copies the solution back
 ```
 GPU errors are reported by throwing `std::runtime_error` from the solver call.
 
+The triangular solves process the lumps (supernodes) level by level of the elimination tree, with
+one threadgroup per lump of a level and a few dispatches per level (large lumps use multi-threadgroup
+tiled kernels), instead of a few dependent dispatches per lump.
+
 ### Backend Selection
 The backend is chosen explicitly with `Settings::backend` (recommended): it determines the
 scalar types that can be used (Metal: float only) and where the data must live (host memory for
@@ -191,6 +201,16 @@ build/baspacho/examples/opt_comp_model -p stats_cpu_f64_potrf.csv -a stats_cpu_f
 on order to fit a computation model that can be provided as a setting to `createSolver` in order
 to fine-tune for your architecture.
 
+### `InitBench`
+Times the symbolic analysis (`createSolver`, with a breakdown of its phases) and checks factor and
+solve on BAL (`-bal`), g2o (`-g2o`), Matrix Market (`-mtx`) or synthetic grid (`-grid3d n bs`)
+problems, eg.
+```
+build/baspacho/benchmarking/InitBench -bal ~/BAL/problem-871-527480-pre.txt -reps 3 -t 16
+```
+It exits with an error if a solution is inaccurate (relative error above 1e-6) or not finite, so it
+can also be used as a numerical check.
+
 ### `BAL_bench`
 It's possible to benchmark on a bundle-adjustment problem from
 [Bundle Adjustment in the Large](https://grail.cs.washington.edu/projects/bal/) as
@@ -215,6 +235,13 @@ and flavors of mixed direct/iterative solvers. The class is used in:
 and complete the solution of a linear system iteratively using PCG.
 
 
+## Testing
+`ctest --test-dir build` runs the unit tests of the backends enabled in the build. GitHub Actions
+(`.github/workflows`) run them on every push: `ci.yml` builds and tests the CPU backends on Linux
+and macOS and checks that the CUDA backend compiles with several toolkits, `metal.yml` runs the
+Metal tests on the macOS runners (which expose a paravirtualized Apple GPU) and reports the
+measured accuracy and GPU timings.
+
 ## Possible future improvements:
 - [ ] handle singularity reporting size of non-SPD minor, possibly discard non-definite sparse-elim
       diagonal blocks as "bad" blocks (eg unconstrained points in BA)
@@ -238,9 +265,14 @@ because matrices naturally have a block-structure depending on parameters of dim
 cuda-kernel operations are designed around blocks so it's not ideal if you have some huge parameter blocks,
 the library will work best when the parameter blocks have sizes 1 to 12 (in a factor graph, generally you
 have many parameter blocks of the same type).
-* **CUDA determinism**: assuming BLAS is deterministic, BaSpaCho will be 100% deterministic on the CPU, but
-not on CUDA if there is any "sparse elimination" set of parameters, because both factor and solve operations
-use atomic addition for parallelism on the GPU. Also, a CUDA architecture >=6 is needed for atomicAdd
+* **Matrices that are not positive definite**: the factorization doesn't throw, the failed diagonal
+block (and what depends on it) is NaN in the factor on all the backends, so it can be detected (eg. with
+`std::isfinite` on the factor) to retry with more damping.
+* **Threads**: `Settings::numThreads` limits the threads used by the symbolic analysis in `createSolver`
+and by the CPU factorization (`BackendFast`); with 1 no thread pool is started.
+* **GPU determinism**: assuming BLAS is deterministic, BaSpaCho will be 100% deterministic on the CPU, but
+not on CUDA or Metal if there is any "sparse elimination" set of parameters, because both factor and solve
+operations use atomic addition for parallelism on the GPU. Also, a CUDA architecture >=6 is needed for atomicAdd
 on double numbers (this is the compute hardware architecture and not the version of CUDA, arch >=6 means
 you need Tesla P100 or GTX 1080-family, or newer. See
 [CUDA Architectures](https://en.wikipedia.org/wiki/CUDA#GPUs_supported)).
