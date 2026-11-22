@@ -103,7 +103,7 @@ static Problem loadG2o(const string& path) {
   string line, tag;
   while (getline(in, line)) {
     istringstream ls(line);
-    ls >> tag;
+    if (!(ls >> tag)) continue;  // blank line
     if (tag.rfind("VERTEX", 0) == 0) {
       int64_t id;
       if (!(ls >> id)) throw runtime_error("bad g2o vertex: " + line);
