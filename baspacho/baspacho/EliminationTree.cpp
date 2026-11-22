@@ -628,20 +628,22 @@ OptInput buildOptInput(const SparseStructure& ss, const vector<int64_t>& paramSi
       if (boards.empty() || boards.back().c != rn) {
         BASPACHO_CHECK(lastSeen[rn] != a);  // contiguity
         lastSeen[rn] = a;
-        boards.push_back(MergeOptimizer::Board{rn, 0, 0, 0, 0});
+        boards.push_back(MergeOptimizer::Board{(int32_t)rn, 0, 0, 0, 0});
       }
       boards.back().bc++;
       boards.back().m += paramSize[r];
     }
     int64_t brDown = 0, rowsDown = 0;
     for (int64_t i = (int64_t)boards.size() - 1; i >= 0; i--) {
-      boards[i].brDown = brDown;
-      boards[i].rowsDown = rowsDown;
+      boards[i].brDown = (int32_t)brDown;
+      boards[i].rowsDown = (int32_t)rowsDown;
       brDown += boards[i].bc;
       rowsDown += boards[i].m;
     }
     in.rows[a] = rowsDown;
+    BASPACHO_CHECK_LT(rowsDown, (int64_t)1 << 31);
   }
+  BASPACHO_CHECK_LT(numCoarse, (int64_t)1 << 31);
   return in;
 }
 
@@ -683,6 +685,10 @@ void EliminationTree::computeMergesOpt(const std::string& mode, const std::strin
   double tInput = secondsSince(t0);
   MergeOptimizer opt(compMod, in.parent, in.size, in.spans, in.rows, in.canMerge, in.sparse,
                      in.colBoards);
+  bool debug = getenv("BASPACHO_MERGE_DEBUG") != nullptr;
+  if (mode != "deep" && !debug) {
+    in.colBoards = vector<vector<MergeOptimizer::Board>>();  // (only needed to rebuild/evaluate)
+  }
   double initial = opt.total;
   int passes = getenv("BASPACHO_PASSES") ? atoi(getenv("BASPACHO_PASSES")) : 20;
   if (mode == "greedy1") {

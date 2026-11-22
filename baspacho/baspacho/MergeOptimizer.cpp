@@ -38,7 +38,7 @@ MergeOptimizer::MergeOptimizer(const ComputationModel& model, vector<int64_t> pa
     }
     for (const Board& b : colBoards[c]) {
       BASPACHO_CHECK_GT(b.c, c);
-      perRow[b.c].push_back(Board{c, b.bc, b.m, b.brDown, b.rowsDown});
+      perRow[b.c].push_back(Board{(int32_t)c, b.bc, b.m, b.brDown, b.rowsDown});
       colSyge[c] += model.sygeLinEst(b.m, b.m + b.rowsDown);
       colAsmbl[c] += model.asmblEst(b.bc + b.brDown, b.bc);
     }
@@ -124,7 +124,7 @@ void MergeOptimizer::applyMerge(int64_t k, int64_t p) {
       if (alive(c)) {
         const Board& e1 = kB[ik];
         const Board& e2 = pB[ip];
-        Board m{c, e1.bc + e2.bc, e1.m + e2.m, e2.brDown, e2.rowsDown};
+        Board m{(int32_t)c, e1.bc + e2.bc, e1.m + e2.m, e2.brDown, e2.rowsDown};
         colSyge[c] += model.sygeLinEst(m.m, m.m + m.rowsDown) -
                       model.sygeLinEst(e1.m, e1.m + e1.rowsDown) -
                       model.sygeLinEst(e2.m, e2.m + e2.rowsDown);

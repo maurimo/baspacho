@@ -29,12 +29,12 @@ namespace BaSpaCho {
 struct MergeOptimizer {
   // a board: column `c` (or, in the input, the row node) with `bc` blocks and `m` rows in a row
   // node, and `brDown` blocks and `rowsDown` rows after it in the column
-  struct Board {
-    int64_t c;
-    int64_t bc;
-    int64_t m;
-    int64_t brDown;
-    int64_t rowsDown;
+  struct Board {  // (32 bits: the span-level structure of large problems is big)
+    int32_t c;
+    int32_t bc;
+    int32_t m;
+    int32_t brDown;
+    int32_t rowsDown;
   };
 
   // `colBoards[a]`: boards of column a, by row node (`Board::c` = row node), in order
