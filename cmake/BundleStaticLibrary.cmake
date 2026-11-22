@@ -72,20 +72,40 @@ function(bundle_static_library tgt_name bundled_tgt_name)
       set(ar_tool ${CMAKE_CXX_COMPILER_AR})
     endif()
 
+    # MRI scripts (`ar -M`) are supported by GNU ar and llvm-ar, but not by Apple's ar.
+    # With Clang prefer llvm-ar (also looking for versioned names, e.g. llvm-ar-18, and
+    # next to the compiler); on Linux fall back to CMAKE_AR (GNU ar), on Apple to libtool.
+    set(use_libtool OFF)
     if (CMAKE_CXX_COMPILER_ID MATCHES "^(AppleClang|Clang)$")
-      find_program(LLVM_AR NAMES llvm-ar)
+      get_filename_component(_cxx_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+      string(REGEX MATCH "^[0-9]+" _cxx_major "${CMAKE_CXX_COMPILER_VERSION}")
+      find_program(LLVM_AR NAMES llvm-ar "llvm-ar-${_cxx_major}" HINTS "${_cxx_dir}")
       if (LLVM_AR)
         set(ar_tool "${LLVM_AR}")
+      elseif (APPLE)
+        set(use_libtool ON)
       else()
-        message(FATAL_ERROR "llvm-ar not found!")
+        message(STATUS "llvm-ar not found, bundling static library with ${CMAKE_AR}")
       endif()
     endif()
 
-    add_custom_command(
-      COMMAND ${ar_tool} -M < ${CMAKE_CURRENT_BINARY_DIR}/${bundled_tgt_name}.ar
-      OUTPUT ${bundled_tgt_full_name}
-      COMMENT "Bundling ${bundled_tgt_name}"
-      VERBATIM)
+    if (use_libtool)
+      find_program(LIBTOOL_TOOL NAMES libtool REQUIRED)
+      add_custom_command(
+        COMMAND ${LIBTOOL_TOOL} -static -o ${bundled_tgt_full_name} ${static_libs}
+        OUTPUT ${bundled_tgt_full_name}
+        DEPENDS ${static_libs}
+        COMMENT "Bundling ${bundled_tgt_name}"
+        VERBATIM)
+    else()
+      add_custom_command(
+        COMMAND ${ar_tool} -M < ${CMAKE_CURRENT_BINARY_DIR}/${bundled_tgt_name}.ar
+        OUTPUT ${bundled_tgt_full_name}
+        # rebundle when an input archive (or the script listing them) changes
+        DEPENDS ${static_libs} ${CMAKE_CURRENT_BINARY_DIR}/${bundled_tgt_name}.ar
+        COMMENT "Bundling ${bundled_tgt_name}"
+        VERBATIM)
+    endif()
   elseif(MSVC)
     find_program(lib_tool lib)
 
@@ -96,6 +116,7 @@ function(bundle_static_library tgt_name bundled_tgt_name)
     add_custom_command(
       COMMAND ${lib_tool} /NOLOGO /OUT:${bundled_tgt_full_name} ${static_libs_full_names}
       OUTPUT ${bundled_tgt_full_name}
+      DEPENDS ${static_libs_full_names}
       COMMENT "Bundling ${bundled_tgt_name}"
       VERBATIM)
   else()

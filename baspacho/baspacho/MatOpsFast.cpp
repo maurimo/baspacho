@@ -241,17 +241,25 @@ struct BlasNumericCtx : CpuBaseNumericCtx<T> {
 template <>
 void BlasNumericCtx<double>::potrf(int64_t n, double* data, int64_t offA) {
   auto timer = sym.potrfStat.instance(sizeof(double), n);
-  sym.potrfBiggestN = std::max(sym.potrfBiggestN, n);
+  if (sym.potrfStat.enabled) {  // stats are opt-in
+    sym.potrfBiggestN = std::max(sym.potrfBiggestN, n);
+  }
 
-  LAPACKE_dpotrf(LAPACK_COL_MAJOR, 'U', n, data + offA, n);
+  if (LAPACKE_dpotrf(LAPACK_COL_MAJOR, 'U', n, data + offA, n) != 0) {
+    markFailedFactor(data + offA, n * n);
+  }
 }
 
 template <>
 void BlasNumericCtx<float>::potrf(int64_t n, float* data, int64_t offA) {
   auto timer = sym.potrfStat.instance(sizeof(float), n);
-  sym.potrfBiggestN = std::max(sym.potrfBiggestN, n);
+  if (sym.potrfStat.enabled) {  // stats are opt-in
+    sym.potrfBiggestN = std::max(sym.potrfBiggestN, n);
+  }
 
-  LAPACKE_spotrf(LAPACK_COL_MAJOR, 'U', n, data + offA, n);
+  if (LAPACKE_spotrf(LAPACK_COL_MAJOR, 'U', n, data + offA, n) != 0) {
+    markFailedFactor(data + offA, n * n);
+  }
 }
 
 template <>
@@ -318,7 +326,9 @@ void BlasNumericCtx<double>::saveSyrkGemm(int64_t m, int64_t n, int64_t k, const
   if (doSyrk) {
     cblas_dsyrk(CblasColMajor, CblasUpper, CblasConjTrans, m, k, 1.0, data + offset, k, 0.0,
                 tempBuffer.data(), m);
-    sym.syrkCalls++;
+    if (sym.sygeStat.enabled) {  // stats are opt-in
+      sym.syrkCalls++;
+    }
   }
 
   if (doGemm) {
@@ -328,7 +338,9 @@ void BlasNumericCtx<double>::saveSyrkGemm(int64_t m, int64_t n, int64_t k, const
     cblas_dgemm(CblasColMajor, CblasConjTrans, CblasNoTrans, m, n - gemmStart, k, 1.0,
                 data + offset, k, data + offset + gemmInOffset, k, 0.0,
                 tempBuffer.data() + gemmOutOffset, m);
-    sym.gemmCalls++;
+    if (sym.sygeStat.enabled) {  // stats are opt-in
+      sym.gemmCalls++;
+    }
   }
 }
 
@@ -346,7 +358,9 @@ void BlasNumericCtx<float>::saveSyrkGemm(int64_t m, int64_t n, int64_t k, const 
   if (doSyrk) {
     cblas_ssyrk(CblasColMajor, CblasUpper, CblasConjTrans, m, k, 1.0, data + offset, k, 0.0,
                 tempBuffer.data(), m);
-    sym.syrkCalls++;
+    if (sym.sygeStat.enabled) {  // stats are opt-in
+      sym.syrkCalls++;
+    }
   }
 
   if (doGemm) {
@@ -356,7 +370,9 @@ void BlasNumericCtx<float>::saveSyrkGemm(int64_t m, int64_t n, int64_t k, const 
     cblas_sgemm(CblasColMajor, CblasConjTrans, CblasNoTrans, m, n - gemmStart, k, 1.0,
                 data + offset, k, data + offset + gemmInOffset, k, 0.0,
                 tempBuffer.data() + gemmOutOffset, m);
-    sym.gemmCalls++;
+    if (sym.sygeStat.enabled) {  // stats are opt-in
+      sym.gemmCalls++;
+    }
   }
 }
 #endif  // BASPACHO_USE_BLAS
@@ -817,7 +833,7 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
         dispenso::parallel_for(
             taskSet, dispenso::makeChunkedRange(subBegin, subEnd, 4L),
             [&](int64_t rangeBegin, int64_t rangeEnd) {
-              BASPACHO_CHECK_LE(rangeBegin, rangeEnd + 4);
+              BASPACHO_CHECK_LE(rangeEnd, rangeBegin + 4);
               int64_t dataStart = skel.spanStart[rangeBegin];
               int64_t dataSize = skel.spanStart[rangeEnd] - dataStart;
               T* outData = (T*)alloca(sizeof(T) * dataSize);

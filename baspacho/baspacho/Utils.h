@@ -55,7 +55,9 @@ struct OpStat {
     Instance& operator=(Instance&& that) noexcept {
       stat = that.stat;
       start = that.start;
-      stat = nullptr;
+      argsTuple = std::move(that.argsTuple);
+      that.stat = nullptr;
+      return *this;
     }
 
     Instance(Instance&& that) noexcept : stat(that.stat), start(that.start) { that.stat = nullptr; }
@@ -112,7 +114,7 @@ struct OpStat {
     return enabled ? Instance<SyncOps>(this, args...) : Instance<SyncOps>();
   }
 
-  bool enabled = true;
+  bool enabled = false;  // opt-in, see Solver::enableStats
   int64_t numRuns = 0;
   double totTime = 0;
   double maxTime = 0;

@@ -39,6 +39,13 @@ Solver::Solver(CoalescedBlockMatrixSkel&& factorSkel_, std::vector<int64_t>&& sp
   initElimination();
 }
 
+// a batched op (T = vector<S*>) with no matrix in the batch is a no-op: the GPU backends would
+// launch kernels with empty grids
+template <typename T>
+static bool isEmptyBatch(const T* data) {
+  return Batch<T>::getSize(data) == 0;
+}
+
 template <typename T>
 void Solver::factorLump(NumericCtx<T>& numCtx, T* data, int64_t lump) const {
   int64_t lumpStart = factorSkel.lumpStart[lump];
@@ -164,6 +171,9 @@ void Solver::factorFrom(T* data, int64_t spanIndex, bool verbose) const {
 template <typename T>
 void Solver::internalFactorRange(T* data, int64_t startSpanIndex, int64_t endSpanIndex,
                                  bool verbose) const {
+  if (isEmptyBatch(data)) {
+    return;  // batch of size 0, nothing to do
+  }
   BASPACHO_CHECK_GE(startSpanIndex, 0);
   BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
   BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
@@ -220,6 +230,9 @@ void Solver::internalFactorRange(T* data, int64_t startSpanIndex, int64_t endSpa
 
 template <typename T>
 void Solver::solve(const T* matData, T* vecData, int64_t stride, int nRHS) const {
+  if (isEmptyBatch(matData)) {
+    return;  // batch of size 0, nothing to do
+  }
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
   internalSolveLRange(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
   internalSolveLtRange(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
@@ -227,17 +240,26 @@ void Solver::solve(const T* matData, T* vecData, int64_t stride, int nRHS) const
 
 template <typename T>
 void Solver::solveL(const T* matData, T* vecData, int64_t stride, int nRHS) const {
+  if (isEmptyBatch(matData)) {
+    return;  // batch of size 0, nothing to do
+  }
   solveLUpTo(matData, factorSkel.numSpans(), vecData, stride, nRHS);
 }
 
 template <typename T>
 void Solver::solveLt(const T* matData, T* vecData, int64_t stride, int nRHS) const {
+  if (isEmptyBatch(matData)) {
+    return;  // batch of size 0, nothing to do
+  }
   solveLtUpTo(matData, factorSkel.numSpans(), vecData, stride, nRHS);
 }
 
 template <typename T>
 void Solver::solveLUpTo(const T* matData, int64_t spanIndex, T* vecData, int64_t stride,
                         int nRHS) const {
+  if (isEmptyBatch(matData)) {
+    return;  // batch of size 0, nothing to do
+  }
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
   internalSolveLRange(*slvCtx, matData, 0, spanIndex, vecData, stride, nRHS);
 }
@@ -245,6 +267,9 @@ void Solver::solveLUpTo(const T* matData, int64_t spanIndex, T* vecData, int64_t
 template <typename T>
 void Solver::solveLtUpTo(const T* matData, int64_t spanIndex, T* vecData, int64_t stride,
                          int nRHS) const {
+  if (isEmptyBatch(matData)) {
+    return;  // batch of size 0, nothing to do
+  }
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
   internalSolveLtRange(*slvCtx, matData, 0, spanIndex, vecData, stride, nRHS);
 }
@@ -252,6 +277,9 @@ void Solver::solveLtUpTo(const T* matData, int64_t spanIndex, T* vecData, int64_
 template <typename T>
 void Solver::solveLFrom(const T* matData, int64_t spanIndex, T* vecData, int64_t stride,
                         int nRHS) const {
+  if (isEmptyBatch(matData)) {
+    return;  // batch of size 0, nothing to do
+  }
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
   internalSolveLRange(*slvCtx, matData, spanIndex, factorSkel.numSpans(), vecData, stride, nRHS);
 }
@@ -259,6 +287,9 @@ void Solver::solveLFrom(const T* matData, int64_t spanIndex, T* vecData, int64_t
 template <typename T>
 void Solver::solveLtFrom(const T* matData, int64_t spanIndex, T* vecData, int64_t stride,
                          int nRHS) const {
+  if (isEmptyBatch(matData)) {
+    return;  // batch of size 0, nothing to do
+  }
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
   internalSolveLtRange(*slvCtx, matData, spanIndex, factorSkel.numSpans(), vecData, stride, nRHS);
 }
@@ -399,6 +430,9 @@ void Solver::internalSolveLtRange(SolveCtx<T>& slvCtx, const T* matData, int64_t
 template <typename T>
 void Solver::addMvFrom(const T* matData, int64_t spanIndex, const T* inVecData, int64_t inStride,
                        T* outVecData, int64_t outStride, int nRHS, BaseType<T> alpha) const {
+  if (isEmptyBatch(matData)) {
+    return;  // batch of size 0, nothing to do
+  }
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
 
   BASPACHO_CHECK_GE(spanIndex, 0);
@@ -450,6 +484,9 @@ void Solver::addMvFrom(const T* matData, int64_t spanIndex, const T* inVecData, 
 
 template <typename T>
 void Solver::pseudoFactorFrom(T* data, int64_t spanIndex, bool /* verbose */) const {
+  if (isEmptyBatch(data)) {
+    return;  // batch of size 0, nothing to do
+  }
   NumericCtxPtr<T> numCtx = symCtx->createNumericCtx<T>(maxElimTempSize, data);
   numCtx->pseudoFactorSpans(data, spanIndex, factorSkel.numSpans());
 }
@@ -578,6 +615,16 @@ void Solver::enableStats(bool enable) {
   symCtx->trsmStat.enabled = enable;
   symCtx->sygeStat.enabled = enable;
   symCtx->asmblStat.enabled = enable;
+  symCtx->solveSparseLStat.enabled = enable;
+  symCtx->solveSparseLtStat.enabled = enable;
+  symCtx->pseudoFactorStat.enabled = enable;
+  symCtx->symmStat.enabled = enable;
+  symCtx->solveLStat.enabled = enable;
+  symCtx->solveLtStat.enabled = enable;
+  symCtx->solveGemvStat.enabled = enable;
+  symCtx->solveGemvTStat.enabled = enable;
+  symCtx->solveAssVStat.enabled = enable;
+  symCtx->solveAssVTStat.enabled = enable;
 }
 
 void Solver::resetStats() {
@@ -591,6 +638,16 @@ void Solver::resetStats() {
   symCtx->gemmCalls = 0;
   symCtx->sygeStat.reset();
   symCtx->asmblStat.reset();
+  symCtx->solveSparseLStat.reset();
+  symCtx->solveSparseLtStat.reset();
+  symCtx->pseudoFactorStat.reset();
+  symCtx->symmStat.reset();
+  symCtx->solveLStat.reset();
+  symCtx->solveLtStat.reset();
+  symCtx->solveGemvStat.reset();
+  symCtx->solveGemvTStat.reset();
+  symCtx->solveAssVStat.reset();
+  symCtx->solveAssVTStat.reset();
 }
 
 OpsPtr getBackend(const Settings& settings) {
@@ -617,6 +674,9 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   BASPACHO_CHECK((int64_t)sparseElimRanges.size() != 1);
   int64_t givenSparseElimEnd = sparseElimRanges.empty() ? 0 : sparseElimRanges.back();
   if (!sparseElimRanges.empty()) {
+    // parameters before the first range would otherwise be silently skipped by factor
+    BASPACHO_CHECK_EQ(sparseElimRanges[0], 0);
+    BASPACHO_CHECK_LE(sparseElimRanges.back(), (int64_t)paramSize.size());
     BASPACHO_CHECK(isStrictlyIncreasing(sparseElimRanges, 0, sparseElimRanges.size()));
     for (int64_t id : elimLastIds) {
       BASPACHO_CHECK_GE(id, givenSparseElimEnd);

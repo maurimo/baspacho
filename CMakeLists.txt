@@ -217,7 +217,9 @@ message("* Dispenso Library Dir = " ${dispenso_BINARY_DIR})
 
 # gtest
 if(BASPACHO_BUILD_TESTS)
-  if(NOT DEFINED gtest_SOURCE_DIR)
+  # a parent project may provide gtest (checking gtest_SOURCE_DIR instead would skip
+  # FetchContent when re-configuring, as googletest caches it, and lose the gtest targets)
+  if(NOT TARGET gtest)
     message("${Cyan}=============================[ GTest ]==================================${ColourReset}")
     FetchContent_Declare(
       googletest

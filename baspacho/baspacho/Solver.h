@@ -223,9 +223,11 @@ struct Settings {
  *
  * @param settings settings as explained above
  * @param paramSizes vector with size of the n-th parameter block
- * @param ss a csr structure (ptrs/inds) representing the *blocks*
- * @param sparseElimRanges [a_0, a_1, ..., a_n] where [a_i,a_{i+1}] will be treated as a sparse
- * elimination range
+ * @param ss a csr structure (ptrs/inds) representing the *blocks*, lower half: row i lists the
+ * column blocks j <= i (diagonal blocks included). Required when using sparse elimination ranges
+ * or a fill policy different from AddFillComplete.
+ * @param sparseElimRanges [a_0 = 0, a_1, ..., a_n] where [a_i,a_{i+1}) will be treated as a
+ * sparse elimination range (each a set of parameters which are pairwise independent)
  * @param elimLastIds ids to be kept at the very end in reordering, allowing partial factor
  * that will eliminate all other parameters. Must all be after sparse elimination ranges. If
  * non-empty then the settings.addFillPolicy MUST be AddFillComplete (there is no point in

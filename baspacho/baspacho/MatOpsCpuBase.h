@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <limits>
 #include <vector>
 #include "baspacho/baspacho/MatOps.h"
 #include "baspacho/baspacho/Utils.h"
@@ -116,6 +118,15 @@ struct CpuBaseSymbolicCtx : SymbolicCtx {
   const CoalescedBlockMatrixSkel& skel;
 };
 
+// A failed Cholesky of a diagonal block (not positive definite) leaves the block filled with NaN,
+// so that the failure propagates to the factor and to the solutions, where it can be detected
+// (eg. with std::isfinite, to retry with more damping). LAPACK and Eigen stop at the failed pivot
+// and leave finite values, the GPU backends get NaN from the square root of a negative pivot.
+template <typename T>
+inline void markFailedFactor(T* block, int64_t size) {
+  std::fill(block, block + size, std::numeric_limits<T>::quiet_NaN());
+}
+
 template <typename T>
 struct CpuBaseNumericCtx : NumericCtx<T> {
   CpuBaseNumericCtx(const CpuBaseSymbolicCtx& sym, int64_t bufSize, int64_t numSpans)
@@ -123,10 +134,15 @@ struct CpuBaseNumericCtx : NumericCtx<T> {
 
   virtual void potrf(int64_t n, T* data, int64_t offA) override {
     auto timer = sym.potrfStat.instance(sizeof(T), n);
-    sym.potrfBiggestN = std::max(sym.potrfBiggestN, n);
+    if (sym.potrfStat.enabled) {  // stats are opt-in
+      sym.potrfBiggestN = std::max(sym.potrfBiggestN, n);
+    }
 
     Eigen::Map<MatRMaj<T>> matA(data + offA, n, n);
     Eigen::LLT<Eigen::Ref<MatRMaj<T>>> llt(matA);
+    if (llt.info() != Eigen::Success) {
+      markFailedFactor(data + offA, n * n);
+    }
   }
 
   virtual void trsm(int64_t n, int64_t k, T* data, int64_t offA, int64_t offB) override {
@@ -152,7 +168,9 @@ struct CpuBaseNumericCtx : NumericCtx<T> {
     Eigen::Map<MatRMaj<T>> matC(C, n, m);
     matC.noalias() = matB * matA.transpose();
 
-    sym.gemmCalls++;
+    if (sym.sygeStat.enabled) {  // stats are opt-in
+      sym.gemmCalls++;
+    }
   }
 
   // helper for elimination, does
@@ -166,7 +184,12 @@ struct CpuBaseNumericCtx : NumericCtx<T> {
 
     // in-place lower diag cholesky dec on diagonal block
     Eigen::Map<MatRMaj<T>> diagBlock(data + dataPtr, lumpSize, lumpSize);
-    { Eigen::LLT<Eigen::Ref<MatRMaj<T>>> llt(diagBlock); }
+    {
+      Eigen::LLT<Eigen::Ref<MatRMaj<T>>> llt(diagBlock);
+      if (llt.info() != Eigen::Success) {
+        diagBlock.setConstant(std::numeric_limits<T>::quiet_NaN());  // see markFailedFactor
+      }
+    }
 
     int64_t gatheredStart = skel.boardColPtr[lump];
     int64_t gatheredEnd = skel.boardColPtr[lump + 1];
@@ -194,7 +217,12 @@ struct CpuBaseNumericCtx : NumericCtx<T> {
 
     // in-place lower diag cholesky dec on diagonal block
     OuterStridedMatM<T> diagBlock(data + diagBlockPtr, spanSize, spanSize, OuterStride(lumpSize));
-    { Eigen::LLT<Eigen::Ref<MatRMaj<T>>> llt(diagBlock); }
+    {
+      Eigen::LLT<Eigen::Ref<MatRMaj<T>>> llt(diagBlock);
+      if (llt.info() != Eigen::Success) {
+        diagBlock.setConstant(std::numeric_limits<T>::quiet_NaN());  // see markFailedFactor
+      }
+    }
 
     int64_t gatheredEnd = skel.boardColPtr[lump + 1];
     int64_t rowDataEnd = skel.boardChainColOrd[gatheredEnd - 1];

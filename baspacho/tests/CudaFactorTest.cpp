@@ -8,7 +8,10 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <Eigen/Eigenvalues>
+#include <algorithm>
+#include <cmath>
 #include <iostream>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <sstream>
@@ -230,4 +233,64 @@ TEST(CudaFactor, SparseElimAndFactor_Many_double) {
 
 TEST(CudaFactor, SparseElimAndFactor_Many_float) {
   testSparseElimAndFactor_Many<float>([] { return cudaOps(); });
+}
+
+// Problem with (sparseElim) or without sparse elimination, and positive definite data. In
+// `npdLump` (in the sparse elimination range or among the dense lumps) the diagonal block is
+// then made indefinite by a large negative diagonal entry
+template <typename T>
+static unique_ptr<Solver> makeNotPosDefProblem(OpsPtr&& ops, bool sparseElim, vector<T>& pdData,
+                                               vector<T>& npdData) {
+  auto colBlocks = randomCols(115, 0.03, 57);
+  colBlocks = makeIndependentElimSet(colBlocks, 0, 60);
+  SparseStructure ss = columnsToCscStruct(colBlocks).transpose();
+  vector<int64_t> paramSize = randomVec(ss.ptrs.size() - 1, 2, 5, 47);
+  EliminationTree et(paramSize, ss);
+  et.buildTree();
+  et.processTree(/* compute sparse elim ranges = */ sparseElim);
+  et.computeAggregateStruct();
+  CoalescedBlockMatrixSkel factorSkel(et.computeSpanStart(), et.lumpToSpan, et.colStart,
+                                      et.rowParam);
+  vector<int64_t> elimRanges = et.sparseElimRanges;
+  EXPECT_EQ(elimRanges.size() >= 2, sparseElim);
+  auto solver =
+      make_unique<Solver>(std::move(factorSkel), std::move(elimRanges), vector<int64_t>{},
+                          std::move(ops));
+  const auto& skel = solver->skel();
+  pdData = randomData<T>(skel.dataSize(), -1.0, 1.0, 9);
+  skel.damp(pdData, T(0), T(skel.order() * 1.3));
+  int64_t denseStart = sparseElim ? solver->sparseEliminationRanges().back() : 0;
+  int64_t npdLump = sparseElim ? 3 : (denseStart + skel.numLumps()) / 2;
+  npdData = pdData;
+  npdData[skel.chainData[skel.chainColPtr[npdLump]]] = -T(skel.order() * 1000);
+  return solver;
+}
+
+static bool allFinite(const vector<double>& v) {
+  return std::all_of(v.begin(), v.end(), [](double x) { return std::isfinite(x); });
+}
+static bool allFinite(const vector<float>& v) {
+  return std::all_of(v.begin(), v.end(), [](float x) { return std::isfinite(x); });
+}
+
+template <typename T>
+void testNotPositiveDefinite(bool sparseElim) {
+  vector<T> pdData, npdData;
+  auto solver = makeNotPosDefProblem<T>(cudaOps(), sparseElim, pdData, npdData);
+  for (vector<T>* d : {&pdData, &npdData}) {
+    DevMirror<T> dataGpu(*d);
+    solver->factor(dataGpu.ptr);
+    dataGpu.get(*d);
+  }
+  EXPECT_TRUE(allFinite(pdData));
+  EXPECT_FALSE(allFinite(npdData));
+}
+
+TEST(CudaFactor, NotPositiveDefinite_double) {
+  testNotPositiveDefinite<double>(false);
+  testNotPositiveDefinite<double>(true);
+}
+TEST(CudaFactor, NotPositiveDefinite_float) {
+  testNotPositiveDefinite<float>(false);
+  testNotPositiveDefinite<float>(true);
 }

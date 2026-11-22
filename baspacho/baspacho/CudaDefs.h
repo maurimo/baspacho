@@ -14,6 +14,7 @@
 #include <cusolverSp.h>
 #include <cusparse.h>
 #include <cstdio>
+#include <stdexcept>
 #include <vector>
 
 namespace BaSpaCho {
@@ -24,52 +25,83 @@ const char* cusolverGetErrorEnum(cusolverStatus_t error);
 
 }  // end namespace BaSpaCho
 
-#define cuCHECK(call)                                                                           \
-  do {                                                                                          \
-    cudaError_t err = (call);                                                                   \
-    if (cudaSuccess != err) {                                                                   \
-      fprintf(stderr, "[%s:%d] CUDA Error: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-      cudaDeviceReset();                                                                        \
-      abort();                                                                                  \
-    }                                                                                           \
+// CUDA errors are reported by throwing std::runtime_error. In particular we never call
+// `cudaDeviceReset()` (which would also destroy the context used by the rest of the process,
+// e.g. PyTorch) nor `abort()`, so that applications can catch and report errors.
+#define BASPACHO_CUDA_FAIL(kind, msg)                                                         \
+  do {                                                                                     \
+    char _bspc_buf[512];                                                                   \
+    snprintf(_bspc_buf, sizeof(_bspc_buf), "[%s:%d] %s Error: %s", __FILE__, __LINE__, kind, \
+             msg);                                                                         \
+    throw std::runtime_error(_bspc_buf);                                                   \
   } while (0)
 
-#define cublasCHECK(call)                                                            \
-  do {                                                                               \
-    cublasStatus_t status = (call);                                                  \
-    if (CUBLAS_STATUS_SUCCESS != status) {                                           \
-      fprintf(stderr, "CUBLAS Error: %s\n", ::BaSpaCho::cublasGetErrorEnum(status)); \
-      cudaDeviceReset();                                                             \
-      abort();                                                                       \
-    }                                                                                \
+// variant to be used in destructors / cleanup code: only print the error
+#define BASPACHO_CUDA_WARN(kind, msg) \
+  fprintf(stderr, "[%s:%d] %s Error: %s\n", __FILE__, __LINE__, kind, msg)
+
+#define cuCHECK(call)                                       \
+  do {                                                      \
+    cudaError_t err = (call);                               \
+    if (cudaSuccess != err) {                               \
+      BASPACHO_CUDA_FAIL("CUDA", cudaGetErrorString(err));  \
+    }                                                       \
   } while (0)
 
-#define cusparseCHECK(call)                                                              \
-  do {                                                                                   \
-    cusparseStatus_t status = (call);                                                    \
-    if (CUSPARSE_STATUS_SUCCESS != status) {                                             \
-      fprintf(stderr, "CUSPARSE Error: %s\n", ::BaSpaCho::cusparseGetErrorEnum(status)); \
-      cudaDeviceReset();                                                                 \
-      abort();                                                                           \
-    }                                                                                    \
+#define cuWARN(call)                                        \
+  do {                                                      \
+    cudaError_t err = (call);                               \
+    if (cudaSuccess != err) {                               \
+      BASPACHO_CUDA_WARN("CUDA", cudaGetErrorString(err));  \
+    }                                                       \
   } while (0)
 
-#define cusolverCHECK(call)                                                              \
-  do {                                                                                   \
-    cusolverStatus_t status = (call);                                                    \
-    if (CUSOLVER_STATUS_SUCCESS != status) {                                             \
-      fprintf(stderr, "CUSOLVER Error: %s\n", ::BaSpaCho::cusolverGetErrorEnum(status)); \
-      cudaDeviceReset();                                                                 \
-      abort();                                                                           \
-    }                                                                                    \
+#define cublasCHECK(call)                                                       \
+  do {                                                                          \
+    cublasStatus_t status = (call);                                             \
+    if (CUBLAS_STATUS_SUCCESS != status) {                                      \
+      BASPACHO_CUDA_FAIL("CUBLAS", ::BaSpaCho::cublasGetErrorEnum(status));     \
+    }                                                                           \
   } while (0)
 
-#define CHECK_ALLOCATION(ptr, size)                                           \
-  if (ptr == nullptr) {                                                       \
-    fprintf(stderr, "CUDA: allocation of block of %ld bytes failed\n", size); \
-    cudaDeviceReset();                                                        \
-    abort();                                                                  \
-  }
+#define cublasWARN(call)                                                        \
+  do {                                                                          \
+    cublasStatus_t status = (call);                                             \
+    if (CUBLAS_STATUS_SUCCESS != status) {                                      \
+      BASPACHO_CUDA_WARN("CUBLAS", ::BaSpaCho::cublasGetErrorEnum(status));     \
+    }                                                                           \
+  } while (0)
+
+#define cusparseCHECK(call)                                                     \
+  do {                                                                          \
+    cusparseStatus_t status = (call);                                           \
+    if (CUSPARSE_STATUS_SUCCESS != status) {                                    \
+      BASPACHO_CUDA_FAIL("CUSPARSE", ::BaSpaCho::cusparseGetErrorEnum(status)); \
+    }                                                                           \
+  } while (0)
+
+#define cusolverCHECK(call)                                                     \
+  do {                                                                          \
+    cusolverStatus_t status = (call);                                           \
+    if (CUSOLVER_STATUS_SUCCESS != status) {                                    \
+      BASPACHO_CUDA_FAIL("CUSOLVER", ::BaSpaCho::cusolverGetErrorEnum(status)); \
+    }                                                                           \
+  } while (0)
+
+#define cusolverWARN(call)                                                      \
+  do {                                                                          \
+    cusolverStatus_t status = (call);                                           \
+    if (CUSOLVER_STATUS_SUCCESS != status) {                                    \
+      BASPACHO_CUDA_WARN("CUSOLVER", ::BaSpaCho::cusolverGetErrorEnum(status)); \
+    }                                                                           \
+  } while (0)
+
+#define CHECK_ALLOCATION(ptr, size)                         \
+  do {                                                      \
+    if (ptr == nullptr) {                                   \
+      BASPACHO_CUDA_FAIL("CUDA", "allocation failed");      \
+    }                                                       \
+  } while (0)
 
 // utility class to mirror an std::vector on the gpu
 template <typename T>
@@ -79,7 +111,7 @@ struct DevMirror {
   ~DevMirror() { clear(); }
   void clear() {
     if (ptr) {
-      cuCHECK(cudaFree(ptr));
+      cuWARN(cudaFree(ptr));
       ptr = nullptr;
       allocSize = 0;
     }
@@ -122,7 +154,7 @@ struct DevPtrMirror {
   DevPtrMirror(const std::vector<T*>& vec, int64_t offset = 0) { load(vec, offset); }
   void clear() {
     if (ptr) {
-      cuCHECK(cudaFree(ptr));
+      cuWARN(cudaFree(ptr));
       ptr = nullptr;
       allocSize = 0;
     }
