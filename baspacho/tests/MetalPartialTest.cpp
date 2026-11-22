@@ -507,3 +507,39 @@ void testGpuResidentPipeline(Kind kind) {
 
 TEST(MetalPartial, GpuResidentPipeline_SparseElim) { testGpuResidentPipeline(Kind::SparseElim); }
 TEST(MetalPartial, GpuResidentPipeline_LargeLumps) { testGpuResidentPipeline(Kind::LargeLumps); }
+
+// Partial solves at every cut (lump boundary) of the dense part: the level solve (one schedule
+// for all the ranges) and the lump-by-lump solve give the same results
+TEST(MetalPartial, LevelVsLumpwise_AllCuts) {
+  for (Kind kind : {Kind::SparseElim, Kind::LargeLumps}) {
+    Problem p = makeProblem(kind, 0, 3.0);
+    MetalMirror<float> dataGpu(p.data);
+    const auto& skel = p.solver->skel();
+    const auto& ranges = p.solver->sparseEliminationRanges();
+    int64_t denseStart = ranges.empty() ? 0 : ranges.back();
+    int64_t numCuts = 0;
+    for (int64_t l = denseStart; l <= skel.numLumps(); l++) {
+      int64_t span = skel.lumpToSpan[l];
+      for (SolveOp op : {SolveOp::LUpTo, SolveOp::LtUpTo, SolveOp::LFrom, SolveOp::LtFrom}) {
+        SCOPED_TRACE(string(kindName(kind)) + " cut at span " + to_string(span) + " op " +
+                     to_string((int)op));
+        Vecs v(p.order, 1, 2, 7 + (int)l);
+        vector<float> results[2];
+        for (int levelSolve = 0; levelSolve < 2; levelSolve++) {
+          MetalSolveOptions options;
+          options.levelSolve = levelSolve;
+          MetalSolveOptionsScope scope(options);
+          results[levelSolve] = v.host;
+          MetalMirror<float> vecGpu(results[levelSolve]);
+          runSolveOp(op, *p.solver, dataGpu.ptr(), span, vecGpu.ptr(), v.stride, 2);
+          vecGpu.get(results[levelSolve]);
+        }
+        Eigen::Map<Eigen::VectorXf> r0(results[0].data(), results[0].size()),
+            r1(results[1].data(), results[1].size());
+        ASSERT_LT((r1 - r0).norm(), 1e-5 * std::max(1.0f, r0.norm()));
+      }
+      numCuts++;
+    }
+    EXPECT_GT(numCuts, 2);
+  }
+}

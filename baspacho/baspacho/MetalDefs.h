@@ -61,6 +61,39 @@ constexpr int64_t kMetalMpsGemmMinOps = 64 * 64 * 64;
 // Number of dense products run with MetalPerformanceShaders so far (diagnostics, tests)
 int64_t metalMpsGemmCount();
 
+// Statistics of the GPU work of the numeric/solve contexts so far (diagnostics, tests)
+struct MetalStats {
+  int64_t dispatches;      // kernels encoded (including MetalPerformanceShaders kernels)
+  int64_t commandBuffers;  // command buffers completed
+  double gpuSeconds;       // sum of the GPU execution times of the completed command buffers
+};
+MetalStats metalStats();
+
+// Options of the solves, for benchmarks and tests (the defaults are tuned). The solves run by a
+// thread use the defaults, or the options of the innermost MetalSolveOptionsScope alive in that
+// thread: overrides are local, they can't leak to other threads or outlive the scope
+struct MetalSolveOptions {
+  // solve the dense lumps level by level (see MetalSolveLevels.h), else lump by lump
+  bool levelSolve = true;
+  // in the level solve, the lumps larger than this are solved with their diagonal block by the
+  // tiled kernels (many threadgroups) instead of one threadgroup per lump. If negative: 128 for
+  // 1 RHS, 256 for more (from MetalSolverTest.DenseLumpSolveBench on the CI runners)
+  int64_t levelMaxDiagLump = -1;
+};
+MetalSolveOptions metalSolveOptions();  // current options of the calling thread
+
+class MetalSolveOptionsScope {
+ public:
+  explicit MetalSolveOptionsScope(const MetalSolveOptions& options);
+  ~MetalSolveOptionsScope();
+  MetalSolveOptionsScope(const MetalSolveOptionsScope&) = delete;
+  MetalSolveOptionsScope& operator=(const MetalSolveOptionsScope&) = delete;
+
+ private:
+  MetalSolveOptions options;
+  const MetalSolveOptions* prev;
+};
+
 // Error checking for Metal operations: throws std::runtime_error (the process can recover, eg.
 // falling back to another backend)
 #define mtlCHECK(condition, msg)                                                               \

@@ -376,7 +376,7 @@ void Solver::internalSolveLRange(SolveCtx<T>& slvCtx, const T* matData, int64_t 
   if (factorSkel.numSpans() == factorSkel.numLumps() && slvCtx.hasFragmentedOps() && nRHS == 1) {
     BASPACHO_CHECK_EQ(factorSkel.lumpToSpan[denseOpsFromLump], denseOpsFromLump);
     slvCtx.fragmentedSolveL(matData, denseOpsFromLump, upToLump, vecData);
-  } else {
+  } else if (!slvCtx.solveLRange(matData, denseOpsFromLump, upToLump, vecData, stride)) {
     for (int64_t l = denseOpsFromLump; l < upToLump; l++) {
       int64_t lumpStart = factorSkel.lumpStart[l];
       int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
@@ -430,7 +430,7 @@ void Solver::internalSolveLtRange(SolveCtx<T>& slvCtx, const T* matData, int64_t
   if (numSpans == upToLump - denseOpsFromLump && slvCtx.hasFragmentedOps() && nRHS == 1) {
     BASPACHO_CHECK_EQ(factorSkel.lumpToSpan[denseOpsFromLump], denseOpsFromLump);
     slvCtx.fragmentedSolveLt(matData, denseOpsFromLump, upToLump, vecData);
-  } else {
+  } else if (!slvCtx.solveLtRange(matData, denseOpsFromLump, upToLump, vecData, stride)) {
     for (int64_t l = upToLump - 1; l >= denseOpsFromLump; l--) {
       int64_t lumpStart = factorSkel.lumpStart[l];
       int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;

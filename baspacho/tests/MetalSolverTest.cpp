@@ -184,7 +184,35 @@ struct Errors {
   double residual;  // |A x - b| / |b|
   double factorMs;  // time of factor (second run, after warm-up), informative only
   double solveMs;   // time of solve (second run)
+  // Metal only (second run): GPU execution time, kernels dispatched, command buffers
+  double factorGpuMs = 0, solveGpuMs = 0;
+  int64_t factorDispatches = 0, solveDispatches = 0, factorCmdBufs = 0, solveCmdBufs = 0;
+  // Metal only: median GPU time of the solve lump by lump and level by level (same runner)
+  double solveGpuMsLumpwise = 0, solveGpuMsLevel = 0;
 };
+
+#ifdef BASPACHO_USE_METAL
+// Median GPU time of `reps` solves of a factored matrix, with the given solve options
+double gpuSolveMs(const Solver& solver, const MetalMirror<float>& dataGpu, const vector<float>& rhs,
+                  int nRHS, const MetalSolveOptions& options, int reps = 5,
+                  vector<float>* result = nullptr) {
+  MetalSolveOptionsScope scope(options);
+  vector<double> times;
+  vector<float> x = rhs;
+  for (int r = 0; r < reps; r++) {
+    MetalMirror<float> xGpu(rhs);
+    MetalStats s0 = metalStats();
+    solver.solve(dataGpu.ptr(), xGpu.ptr(), solver.order(), nRHS);
+    times.push_back((metalStats().gpuSeconds - s0.gpuSeconds) * 1e3);
+    xGpu.get(x);
+  }
+  if (result) {
+    *result = x;
+  }
+  sort(times.begin(), times.end());
+  return times[times.size() / 2];
+}
+#endif
 
 double msSince(chrono::steady_clock::time_point t0) {
   return chrono::duration<double, milli>(chrono::steady_clock::now() - t0).count();
@@ -219,18 +247,34 @@ Errors factorSolveErrors(BackendType backend, const Problem& prob, int nRHS, int
   const vector<float> data0 = data;
   vector<float> x;
   double factorMs = 0, solveMs = 0;
+  Errors e;
   for (int run = 0; run < 2; run++) {
     data = data0;
     x = rhs;
     if (backend == BackendMetal) {
 #ifdef BASPACHO_USE_METAL
       MetalMirror<float> dataGpu(data), xGpu(x);
+      MetalStats s0 = metalStats();
       auto t0 = chrono::steady_clock::now();
       solver->factor(dataGpu.ptr());
       factorMs = msSince(t0);
+      MetalStats s1 = metalStats();
       t0 = chrono::steady_clock::now();
       solver->solve(dataGpu.ptr(), xGpu.ptr(), order, nRHS);
       solveMs = msSince(t0);
+      MetalStats s2 = metalStats();
+      e.factorGpuMs = (s1.gpuSeconds - s0.gpuSeconds) * 1e3;
+      e.solveGpuMs = (s2.gpuSeconds - s1.gpuSeconds) * 1e3;
+      e.factorDispatches = s1.dispatches - s0.dispatches;
+      e.solveDispatches = s2.dispatches - s1.dispatches;
+      e.factorCmdBufs = s1.commandBuffers - s0.commandBuffers;
+      e.solveCmdBufs = s2.commandBuffers - s1.commandBuffers;
+      if (run == 1) {
+        MetalSolveOptions lumpwise, level;
+        lumpwise.levelSolve = false;
+        e.solveGpuMsLumpwise = gpuSolveMs(*solver, dataGpu, rhs, nRHS, lumpwise);
+        e.solveGpuMsLevel = gpuSolveMs(*solver, dataGpu, rhs, nRHS, level);
+      }
       dataGpu.get(data);
       xGpu.get(x);
 #endif
@@ -246,7 +290,6 @@ Errors factorSolveErrors(BackendType backend, const Problem& prob, int nRHS, int
 
   MatD L = MatD(solver->skel().densify(data).cast<double>()).triangularView<Eigen::Lower>();
   MatD xm = Eigen::Map<Eigen::MatrixXf>(x.data(), order, nRHS).cast<double>();
-  Errors e;
   e.factor = (L - Lref).norm() / Lref.norm();
   e.solution = (xm - xRef).norm() / xRef.norm();
   e.residual = (A * xm - b).norm() / b.norm();
@@ -263,8 +306,17 @@ constexpr double kFactorTol = 2e-5;
 constexpr double kSolveTol = 2e-5;
 
 void checkErrors(const Errors& e, const char* what) {
-  printf("%s: factor %.2e, solution %.2e, residual %.2e (time: factor %.1f ms, solve %.1f ms)\n",
+  printf("%s: factor %.2e, solution %.2e, residual %.2e (time: factor %.1f ms, solve %.1f ms)",
          what, e.factor, e.solution, e.residual, e.factorMs, e.solveMs);
+  if (e.factorDispatches + e.solveDispatches > 0) {
+    printf(" (GPU: factor %.2f ms, %lld kernels, %lld cmd bufs; solve %.2f ms, %lld kernels, %lld "
+           "cmd bufs)",
+           e.factorGpuMs, (long long)e.factorDispatches, (long long)e.factorCmdBufs, e.solveGpuMs,
+           (long long)e.solveDispatches, (long long)e.solveCmdBufs);
+    printf(" (solve GPU median: lump by lump %.2f ms, level by level %.2f ms)",
+           e.solveGpuMsLumpwise, e.solveGpuMsLevel);
+  }
+  printf("\n");
   EXPECT_LT(e.factor, kFactorTol) << what;
   EXPECT_LT(e.solution, kSolveTol) << what;
   EXPECT_LT(e.residual, kSolveTol) << what;
@@ -311,6 +363,47 @@ TEST(MetalSolver, Grid3d_MpsGemm) {
 }
 
 // the Metal backend is float-only: double must be rejected with an exception
+// GPU time of the solve of one dense lump of size n (the diagonal solve), lump by lump (tiled
+// kernels), level by level with one threadgroup per lump, and level by level with the tiled
+// kernels: to tune MetalSolveOptions::levelMaxDiagLump. Also checks the results agree
+TEST(MetalSolver, DenseLumpSolveBench) {
+  for (int nRHS : {1, 4}) {
+    for (int64_t n : {64, 128, 192, 256, 384, 512, 768, 1024}) {
+      Problem prob;
+      prob.paramSize = {n};
+      prob.ss.ptrs = {0, 1};
+      prob.ss.inds = {0};
+      Settings settings;
+      settings.backend = BackendMetal;
+      SolverPtr solver = createSolver(settings, prob.paramSize, prob.ss, prob.elimRanges);
+      vector<float> data = randomSpdData(*solver, prob, n);
+      MetalMirror<float> dataGpu(data);
+      solver->factor(dataGpu.ptr());
+      mt19937 gen(n);
+      uniform_real_distribution<float> dist(-1.0f, 1.0f);
+      vector<float> rhs(n * nRHS);
+      for (auto& v : rhs) {
+        v = dist(gen);
+      }
+      MetalSolveOptions lumpwise, levelOneTg, levelTiled;
+      lumpwise.levelSolve = false;
+      levelOneTg.levelMaxDiagLump = int64_t(1) << 40;
+      levelTiled.levelMaxDiagLump = 0;
+      vector<float> x0, x1, x2;
+      double t0 = gpuSolveMs(*solver, dataGpu, rhs, nRHS, lumpwise, 5, &x0);
+      double t1 = gpuSolveMs(*solver, dataGpu, rhs, nRHS, levelOneTg, 5, &x1);
+      double t2 = gpuSolveMs(*solver, dataGpu, rhs, nRHS, levelTiled, 5, &x2);
+      printf("lump bench n=%lld nRHS=%d: lump by lump %.3f ms, level 1 threadgroup %.3f ms, "
+             "level tiled %.3f ms\n",
+             (long long)n, nRHS, t0, t1, t2);
+      Eigen::Map<Eigen::VectorXf> v0(x0.data(), x0.size()), v1(x1.data(), x1.size()),
+          v2(x2.data(), x2.size());
+      EXPECT_LT((v1 - v0).norm(), 1e-4 * v0.norm()) << "n=" << n;
+      EXPECT_LT((v2 - v0).norm(), 1e-4 * v0.norm()) << "n=" << n;
+    }
+  }
+}
+
 TEST(MetalSolver, DoubleRejected) {
   Problem prob = makeBa(5, 20, 6, 1);
   Settings settings;

@@ -876,3 +876,252 @@ kernel void set_span_to_chain_offset_float(device const int64_t* chainRowSpan [[
         spanToChainOffset[chainRowSpan[i]] = chainData[i];
     }
 }
+
+// ============================================================================
+// Level solve kernels (see MetalSolveLevels.h): the lumps of a level of the elimination tree are
+// processed together, one threadgroup per lump. Vectors are column-major (stride ldc).
+// ============================================================================
+
+// Must match MetalLevelSolveParams in MetalSolveLevels.h
+struct LevelSolveParams {
+    int64_t listOff;   // the lump of threadgroup tg is levelLumps[listOff + tg]...
+    int64_t useList;   // ...if useList, else it's listOff + tg
+    int64_t srcBegin;  // the update of a lump in the solve with L only uses the blocks in the
+    int64_t srcEnd;    // columns of the lumps in [srcBegin, srcEnd)
+    int64_t ldc;
+    int64_t nRHS;
+    int64_t transpose;  // solve with L^T
+    int64_t maxDiag;    // level_diag_solve_float skips the lumps larger than this
+    int64_t rowChunk;   // level_update_float: rows of a lump per threadgroup (y = chunk index)
+};
+
+#define LEVEL_SOLVE_ARGS                                                  \
+    device const int64_t* lumpStart [[buffer(0)]],                        \
+    device const int64_t* spanStart [[buffer(1)]],                        \
+    device const int64_t* lumpToSpan [[buffer(2)]],                       \
+    device const int64_t* spanToLump [[buffer(3)]],                       \
+    device const int64_t* chainColPtr [[buffer(4)]],                      \
+    device const int64_t* chainRowSpan [[buffer(5)]],                     \
+    device const int64_t* chainData [[buffer(6)]],                        \
+    device const int64_t* rowChainPtr [[buffer(7)]],                      \
+    device const int64_t* rowChainIdx [[buffer(8)]],                      \
+    device const int64_t* rowChainLump [[buffer(9)]],                     \
+    device const int64_t* levelLumps [[buffer(10)]],                      \
+    device const float* data [[buffer(11)]],                              \
+    device float* x [[buffer(12)]],                                       \
+    constant LevelSolveParams& p [[buffer(13)]],                          \
+    uint2 lid2 [[thread_position_in_threadgroup]],                        \
+    uint2 nth2 [[threads_per_threadgroup]],                               \
+    uint2 tg [[threadgroup_position_in_grid]]
+
+// Update of the rows [rowBegin, rowEnd) of lump `lump` with the solved lumps:
+// - solve with L: x[t] -= L[t, l] * x[l], for the blocks in row t (in the columns of the lumps
+//   in [srcBegin, srcEnd))
+// - solve with L^T: x[l] -= L[t, l]^T * x[t], for the blocks in column l (below the diagonal)
+// Each thread computes some elements of x[lump], no synchronization needed
+inline void levelUpdate(device const int64_t* lumpStart, device const int64_t* spanStart,
+                        device const int64_t* lumpToSpan, device const int64_t* spanToLump,
+                        device const int64_t* chainColPtr, device const int64_t* chainRowSpan,
+                        device const int64_t* chainData, device const int64_t* rowChainPtr,
+                        device const int64_t* rowChainIdx, device const int64_t* rowChainLump,
+                        device const float* data, device float* x, constant LevelSolveParams& p,
+                        int64_t lump, int rowBegin, int rowEnd, uint lid, uint nth) {
+    const int64_t start = lumpStart[lump];
+    const int n = int(lumpStart[lump + 1] - start);
+    const int nr = rowEnd - rowBegin, nRHS = int(p.nRHS);
+    const int64_t ldc = p.ldc;
+
+    if (p.transpose == 0) {
+        const int64_t span0 = lumpToSpan[lump], span1 = lumpToSpan[lump + 1];
+        for (int e = int(lid); e < nr * nRHS; e += int(nth)) {
+            const int i = rowBegin + e % nr, k = e / nr;
+            // span of row start + i (bisection on the spans of the lump)
+            int64_t a = span0, b = span1;
+            while (b - a > 1) {
+                int64_t m = (a + b) / 2;
+                if (spanStart[m] <= start + i) {
+                    a = m;
+                } else {
+                    b = m;
+                }
+            }
+            const int r = int(start + i - spanStart[a]);  // row in the span
+            float acc = 0.0f;
+            for (int64_t q = rowChainPtr[a]; q < rowChainPtr[a + 1]; q++) {
+                const int64_t l = rowChainLump[q];
+                if (l < p.srcBegin) {
+                    continue;
+                }
+                if (l >= p.srcEnd) {
+                    break;
+                }
+                const int64_t lStart = lumpStart[l];
+                const int w = int(lumpStart[l + 1] - lStart);
+                device const float* blk = data + chainData[rowChainIdx[q]] + int64_t(r) * w;
+                device const float* xl = x + lStart + k * ldc;
+                for (int j = 0; j < w; j++) {
+                    acc += blk[j] * xl[j];
+                }
+            }
+            x[start + i + k * ldc] -= acc;
+        }
+    } else {
+        for (int e = int(lid); e < nr * nRHS; e += int(nth)) {
+            const int i = rowBegin + e % nr, k = e / nr;
+            float acc = 0.0f;
+            for (int64_t c = chainColPtr[lump]; c < chainColPtr[lump + 1]; c++) {
+                const int64_t s = chainRowSpan[c];
+                if (spanToLump[s] <= lump) {
+                    continue;  // diagonal block
+                }
+                const int64_t sStart = spanStart[s];
+                const int ns = int(spanStart[s + 1] - sStart);
+                device const float* blk = data + chainData[c] + i;  // ns x n block, column i
+                device const float* xs = x + sStart + k * ldc;
+                for (int r = 0; r < ns; r++) {
+                    acc += blk[int64_t(r) * n] * xs[r];
+                }
+            }
+            x[start + i + k * ldc] -= acc;
+        }
+    }
+}
+
+inline int64_t levelLump(constant LevelSolveParams& p, device const int64_t* levelLumps, uint tg) {
+    return p.useList ? levelLumps[p.listOff + int64_t(tg)] : p.listOff + int64_t(tg);
+}
+
+// Update of the rows of the lumps: threadgroup (x, y) updates the y-th chunk of rowChunk rows of
+// the x-th lump (see levelUpdate)
+kernel void level_update_float(LEVEL_SOLVE_ARGS) {
+    const uint lid = lid2.x, nth = nth2.x;  // 1D threadgroups (uint2: all scalar or all vectors)
+    const int64_t lump = levelLump(p, levelLumps, tg.x);
+    const int n = int(lumpStart[lump + 1] - lumpStart[lump]);
+    const int rowBegin = int(tg.y) * int(p.rowChunk);
+    if (rowBegin >= n) {
+        return;
+    }
+    const int rowEnd = (n - rowBegin) < int(p.rowChunk) ? n : rowBegin + int(p.rowChunk);
+    levelUpdate(lumpStart, spanStart, lumpToSpan, spanToLump, chainColPtr, chainRowSpan, chainData,
+                rowChainPtr, rowChainIdx, rowChainLump, data, x, p, lump, rowBegin, rowEnd, lid,
+                nth);
+}
+
+#define kLevelMaxChunk 8  // max right hand sides per pass of the diagonal solve (256 / 32)
+
+// Solve with the diagonal block of each lump (one threadgroup per lump), of any size: L * x = x
+// or L^T * x = x in place. The diagonal block is processed in tiles of up to kDenseTile rows
+// (staged in threadgroup memory), and the right hand sides in chunks. In a tile each thread
+// owns an element of x (in a register) and the solved values are exchanged in threadgroup memory,
+// one barrier per row. The rest of the lump is then updated with the solved tile (kept in
+// threadgroup memory): in the solve with L the blocks of L below the tile are staged in
+// threadgroup memory (so that they are read from device memory by consecutive threads), in the
+// solve with L^T the blocks on the left of the tile are read directly (by consecutive threads).
+// Sizes are 32 bit integers, offsets in the vectors are 64 bit. Lumps larger than p.maxDiag
+// are skipped (solved by the tiled kernels, which use many threadgroups).
+kernel void level_diag_solve_float(LEVEL_SOLVE_ARGS) {
+    const uint lid = lid2.x, nth = nth2.x;  // 1D threadgroups (uint2: all scalar or all vectors)
+    threadgroup float lt[kDenseTile][kDenseTile + 1];  // diagonal tile, then the blocks below
+    threadgroup float xt[kLevelMaxChunk][kDenseTile];  // solved tile of x
+    threadgroup float piv[2][kLevelMaxChunk];
+
+    const int64_t lump = levelLump(p, levelLumps, tg.x);
+    const int64_t start = lumpStart[lump];
+    const int n = int(lumpStart[lump + 1] - start);
+    if (n > p.maxDiag) {
+        return;  // large lump, solved by the tiled kernels
+    }
+    const int64_t ldc = p.ldc;
+    const int nRHS = int(p.nRHS);
+    const bool transpose = p.transpose != 0;
+    device const float* L = data + chainData[chainColPtr[lump]];  // n x n, row-major
+    device float* xl = x + start;
+
+    const int t = int(lid), nt = int(nth);
+    const int tile = nt < kDenseTile ? nt : kDenseTile;
+    const int chunk = nt / tile;  // <= kLevelMaxChunk
+    const int myI = t % tile, myK = t / tile;
+    const int numTiles = (n + tile - 1) / tile;
+
+    for (int k0 = 0; k0 < nRHS; k0 += chunk) {
+        const int kc = (nRHS - k0) < chunk ? (nRHS - k0) : chunk;
+        for (int tt = 0; tt < numTiles; tt++) {
+            const int jb = (transpose ? numTiles - 1 - tt : tt) * tile;
+            const int bs = (n - jb) < tile ? (n - jb) : tile;
+
+            for (int e = t; e < bs * bs; e += nt) {
+                const int r = e / bs, c = e % bs;
+                if (c <= r) {
+                    lt[r][c] = L[int64_t(jb + r) * n + jb + c];
+                }
+            }
+            const bool owner = myI < bs && myK < kc;
+            device float* xp = xl + (jb + myI) + int64_t(k0 + myK) * ldc;
+            float v = owner ? *xp : 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // piv is double buffered: the values of step j are read before the barrier of step j+1
+            if (!transpose) {
+                for (int j = 0; j < bs; j++) {
+                    if (owner && myI == j) {
+                        v /= lt[j][j];
+                        piv[j & 1][myK] = v;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (owner && myI > j) {
+                        v -= lt[myI][j] * piv[j & 1][myK];
+                    }
+                }
+            } else {
+                for (int j = bs - 1; j >= 0; j--) {
+                    if (owner && myI == j) {
+                        v /= lt[j][j];
+                        piv[j & 1][myK] = v;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (owner && myI < j) {
+                        v -= lt[j][myI] * piv[j & 1][myK];
+                    }
+                }
+            }
+            if (owner) {
+                *xp = v;
+                xt[myK][myI] = v;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);  // xt is complete, lt can be reused
+
+            // update the rest of the lump with the solved tile
+            if (!transpose) {
+                // x[i] -= L[i, jb:jb+bs] * x[jb:jb+bs], for i in [jb + bs, n), by blocks of rows
+                for (int i0 = jb + bs; i0 < n; i0 += tile) {
+                    const int rb = (n - i0) < tile ? (n - i0) : tile;
+                    for (int e = t; e < rb * bs; e += nt) {
+                        const int r = e / bs, c = e % bs;
+                        lt[r][c] = L[int64_t(i0 + r) * n + jb + c];
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (int e = t; e < rb * kc; e += nt) {
+                        const int r = e % rb, k = e / rb;
+                        float acc = 0.0f;
+                        for (int c = 0; c < bs; c++) {
+                            acc += lt[r][c] * xt[k][c];
+                        }
+                        xl[i0 + r + int64_t(k0 + k) * ldc] -= acc;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);  // before restaging lt
+                }
+            } else {
+                // x[i] -= L[jb:jb+bs, i]^T * x[jb:jb+bs], for i in [0, jb)
+                for (int e = t; e < jb * kc; e += nt) {
+                    const int i = e % jb, k = e / jb;
+                    float acc = 0.0f;
+                    for (int j = 0; j < bs; j++) {
+                        acc += L[int64_t(jb + j) * n + i] * xt[k][j];
+                    }
+                    xl[i + int64_t(k0 + k) * ldc] -= acc;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+        }
+    }
+}
