@@ -17,8 +17,7 @@ namespace BaSpaCho {
 using namespace std;
 
 MergeOptimizer::MergeOptimizer(const ComputationModel& model, vector<int64_t> parent_,
-                               vector<int64_t> size_, vector<int64_t> rows_,
-                               vector<bool> canMerge_,
+                               vector<int64_t> size_, vector<int64_t> rows_, vector<bool> canMerge_,
                                vector<bool> sparse_, const vector<vector<Board>>& colBoards)
     : model(model),
       numNodes(parent_.size()),

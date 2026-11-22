@@ -38,10 +38,10 @@ struct ComputationModelSamples {
 };
 
 struct ComputationModelFitStats {
-  int64_t samples = 0;    // of the operation
-  int64_t kept = 0;       // not rejected as outliers
+  int64_t samples = 0;      // of the operation
+  int64_t kept = 0;         // not rejected as outliers
   double medianRelErr = 0;  // on the kept samples
-  double totalRatio = 0;  // sum of the estimates / sum of the timings (kept samples)
+  double totalRatio = 0;    // sum of the estimates / sum of the timings (kept samples)
 };
 
 // Fits the parameters of each operation's model (including the per-element `asmbl` term) by

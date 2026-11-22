@@ -875,10 +875,9 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   timer.mark("permuteBR");
 
   // auto select computation model (for node merge heuristic), if not provided
-  BackendType backend =
-      settings.backend == BackendAuto ? detectBestBackend() : settings.backend;
+  BackendType backend = settings.backend == BackendAuto ? detectBestBackend() : settings.backend;
   const ComputationModel* compModel =
-      settings.computationModel  ? settings.computationModel
+      settings.computationModel ? settings.computationModel
       : backend == BackendCuda  ? &ComputationModel::model_Cuda117_2080Ti_bounded
       : backend == BackendMetal ? &ComputationModel::model_Metal_CI_paravirtual
                                 : &ComputationModel::model_OpenBlas_i7_1185g7_nonneg;

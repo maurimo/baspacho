@@ -35,8 +35,8 @@ struct ModelNumericCtx : NumericCtx<double> {
       double blocks = c1 - c0 - nDiag;
       est.sparse += model.potrfEst(n);
       if (blocks > 0) {
-        est.sparse += model.trsmEst(n, rows) + model.sygeEst(rows, rows, n) +
-                      model.asmblEst(blocks, blocks);
+        est.sparse +=
+            model.trsmEst(n, rows) + model.sygeEst(rows, rows, n) + model.asmblEst(blocks, blocks);
       }
     }
   }
@@ -56,10 +56,8 @@ struct ModelNumericCtx : NumericCtx<double> {
   void assemble(double*, int64_t rectRowBegin, int64_t, int64_t srcColDataOffset,
                 int64_t srcRectWidth, int64_t numBlockRows, int64_t numBlockCols) override {
     // rows from the target lump to the end of the column
-    double rowsFull =
-        skel.chainRowsTillEnd[srcColDataOffset + numBlockRows - 1] - rectRowBegin;
-    add(3, model.asmblEst(numBlockRows, numBlockCols) +
-               model.asmblElemEst(srcRectWidth, rowsFull));
+    double rowsFull = skel.chainRowsTillEnd[srcColDataOffset + numBlockRows - 1] - rectRowBegin;
+    add(3, model.asmblEst(numBlockRows, numBlockCols) + model.asmblElemEst(srcRectWidth, rowsFull));
   }
   const CoalescedBlockMatrixSkel& skel;
   const ComputationModel& model;

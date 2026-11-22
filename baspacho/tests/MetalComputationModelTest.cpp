@@ -156,9 +156,10 @@ TEST(MetalComputationModel, Fit) {
   }
   collect(grid3d(18, 3), s, 1, AnalysisFast);
   collect(ba(80, 2000, 9), s, 1);
-  printf("metal model samples: potrf %zu, trsm %zu, syge %zu, asmbl %zu; command buffer "
-         "overhead %.1f us\n",
-         s.potrf.size(), s.trsm.size(), s.syge.size(), s.asmbl.size(), overhead * 1e6);
+  printf(
+      "metal model samples: potrf %zu, trsm %zu, syge %zu, asmbl %zu; command buffer "
+      "overhead %.1f us\n",
+      s.potrf.size(), s.trsm.size(), s.syge.size(), s.asmbl.size(), overhead * 1e6);
   ASSERT_GT(s.potrf.size(), 50u);
   ASSERT_GT(s.trsm.size(), 50u);
   ASSERT_GT(s.syge.size(), 50u);
@@ -177,23 +178,25 @@ TEST(MetalComputationModel, Fit) {
   printf("metal model parameters: %s\n", computationModelParams(model).c_str());
   const char* names[4] = {"potrf", "trsm", "syge", "asmbl"};
   for (int i = 0; i < 4; i++) {
-    printf("metal model fit %s: %lld samples, %lld kept, median relative error %.2f, "
-           "estimated/measured total %.2f\n",
-           names[i], (long long)stats[i].samples, (long long)stats[i].kept, stats[i].medianRelErr,
-           stats[i].totalRatio);
+    printf(
+        "metal model fit %s: %lld samples, %lld kept, median relative error %.2f, "
+        "estimated/measured total %.2f\n",
+        names[i], (long long)stats[i].samples, (long long)stats[i].kept, stats[i].medianRelErr,
+        stats[i].totalRatio);
     // loose bound: the paravirtual GPU of the CI runners is noisy
     EXPECT_LT(stats[i].medianRelErr, 1.0);
   }
-  printf("metal model GFlop/s syge(m=n=k): 128 %.1f, 512 %.1f, 2048 %.1f; potrf: 128 %.1f, "
-         "512 %.1f, 2048 %.1f\n",
-         2 * pow(128, 3) / model.sygeEst(128, 128, 128) * 1e-9,
-         2 * pow(512, 3) / model.sygeEst(512, 512, 512) * 1e-9,
-         2 * pow(2048, 3) / model.sygeEst(2048, 2048, 2048) * 1e-9,
-         pow(128, 3) / 3 / model.potrfEst(128) * 1e-9, pow(512, 3) / 3 / model.potrfEst(512) * 1e-9,
-         pow(2048, 3) / 3 / model.potrfEst(2048) * 1e-9);
-  for (double p : {model.potrfParams.minCoeff(), model.trsmParams.minCoeff(),
-                   model.sygeParams.minCoeff(), model.asmblParams.minCoeff(),
-                   model.asmblElemParam}) {
+  printf(
+      "metal model GFlop/s syge(m=n=k): 128 %.1f, 512 %.1f, 2048 %.1f; potrf: 128 %.1f, "
+      "512 %.1f, 2048 %.1f\n",
+      2 * pow(128, 3) / model.sygeEst(128, 128, 128) * 1e-9,
+      2 * pow(512, 3) / model.sygeEst(512, 512, 512) * 1e-9,
+      2 * pow(2048, 3) / model.sygeEst(2048, 2048, 2048) * 1e-9,
+      pow(128, 3) / 3 / model.potrfEst(128) * 1e-9, pow(512, 3) / 3 / model.potrfEst(512) * 1e-9,
+      pow(2048, 3) / 3 / model.potrfEst(2048) * 1e-9);
+  for (double p :
+       {model.potrfParams.minCoeff(), model.trsmParams.minCoeff(), model.sygeParams.minCoeff(),
+        model.asmblParams.minCoeff(), model.asmblElemParam}) {
     EXPECT_TRUE(std::isfinite(p));
     EXPECT_GE(p, 0.0);
   }

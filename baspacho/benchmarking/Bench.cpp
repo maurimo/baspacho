@@ -12,8 +12,8 @@
 #include <map>
 #include <random>
 #include <regex>
-#include "baspacho/baspacho/DebugMacros.h"
 #include "baspacho/baspacho/ComputationModelFit.h"
+#include "baspacho/baspacho/DebugMacros.h"
 #include "baspacho/baspacho/Solver.h"
 #include "baspacho/testing/TestingMatGen.h"
 #include "baspacho/testing/TestingUtils.h"

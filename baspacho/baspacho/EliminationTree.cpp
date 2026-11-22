@@ -6,14 +6,14 @@
  */
 
 #include "baspacho/baspacho/EliminationTree.h"
-#include "baspacho/baspacho/MergeOptimizer.h"
 #include <algorithm>
-#include <unordered_map>
 #include <queue>
 #include <random>
 #include <tuple>
+#include <unordered_map>
 #include "baspacho/baspacho/ComputationModel.h"
 #include "baspacho/baspacho/DebugMacros.h"
+#include "baspacho/baspacho/MergeOptimizer.h"
 #include "baspacho/baspacho/Utils.h"
 
 namespace BaSpaCho {
@@ -298,9 +298,9 @@ void EliminationTree::computeMergesFast() {
     double frac = z / (sm * (sm + 1) / 2 + sm * nodeRows[p]);
     bool willMerge = (z == 0 && (!fundamentalOnly || sm <= fundamentalMaxSize)) ||
                      (!fundamentalOnly && sm <= kRelaxSize[0]) ||
-                     (!fundamentalOnly && ((sm <= kRelaxSize[1] && frac < kRelaxZeros[0]) ||
-                                           (sm <= kRelaxSize[2] && frac < kRelaxZeros[1]) ||
-                                           frac < kRelaxZeros[2]));
+                     (!fundamentalOnly &&
+                      ((sm <= kRelaxSize[1] && frac < kRelaxZeros[0]) ||
+                       (sm <= kRelaxSize[2] && frac < kRelaxZeros[1]) || frac < kRelaxZeros[2]));
     if (willMerge) {
       zeros[p] = z;
       mergeWith[k] = p;
@@ -643,7 +643,6 @@ OptInput buildOptInput(const SparseStructure& ss, const vector<int64_t>& paramSi
   return in;
 }
 
-
 }  // namespace
 
 // span-level partition (root span of each span) of the current merges
@@ -720,8 +719,8 @@ void EliminationTree::computeMergesOptimized(MergeMode mode) {
     }
   }
 
-  OptInput in = buildOptInput(ss, paramSize, parent, coarseOf, numCoarse, forbidMerge,
-                              isSparseElim);
+  OptInput in =
+      buildOptInput(ss, paramSize, parent, coarseOf, numCoarse, forbidMerge, isSparseElim);
   auto newOpt = [&]() {
     return MergeOptimizer(compMod, in.parent, in.size, in.rows, in.canMerge, in.sparse,
                           in.colBoards);

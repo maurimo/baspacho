@@ -21,12 +21,11 @@ using namespace std;
 
 namespace {
 
-const ComputationModel kTrue(Eigen::Vector4d(2e-6, 1e-8, 3e-9, 1e-11),
-                             (Eigen::Matrix<double, 6, 1>() << 1e-6, 0, 2e-9, 1e-9, 1e-10, 2e-11)
-                                 .finished(),
-                             (Eigen::Matrix<double, 6, 1>() << 5e-7, 1e-9, 4e-10, 5e-9, 1e-9, 3e-11)
-                                 .finished(),
-                             Eigen::Vector4d(3e-7, 4e-8, 2e-7, 4e-9), 6e-10);
+const ComputationModel kTrue(
+    Eigen::Vector4d(2e-6, 1e-8, 3e-9, 1e-11),
+    (Eigen::Matrix<double, 6, 1>() << 1e-6, 0, 2e-9, 1e-9, 1e-10, 2e-11).finished(),
+    (Eigen::Matrix<double, 6, 1>() << 5e-7, 1e-9, 4e-10, 5e-9, 1e-9, 3e-11).finished(),
+    Eigen::Vector4d(3e-7, 4e-8, 2e-7, 4e-9), 6e-10);
 
 // samples of `kTrue` with multiplicative noise and a few outliers (descheduled process)
 ComputationModelSamples syntheticSamples() {
@@ -40,8 +39,8 @@ ComputationModelSamples syntheticSamples() {
     s.potrf.push_back({n, t(kTrue.potrfEst(n), i)});
     s.trsm.push_back({n, k, t(kTrue.trsmEst(n, k), i)});
     s.syge.push_back({m, m + n, k, t(kTrue.sygeEst(m, m + n, k), i)});
-    s.asmbl.push_back({br + bc, bc, m, m + n,
-                       t(kTrue.asmblEst(br + bc, bc) + kTrue.asmblElemEst(m, m + n), i)});
+    s.asmbl.push_back(
+        {br + bc, bc, m, m + n, t(kTrue.asmblEst(br + bc, bc) + kTrue.asmblElemEst(m, m + n), i)});
   }
   return s;
 }
@@ -104,9 +103,9 @@ TEST(ComputationModelFit, CollectFromFactor) {
   solver->skel().damp(data, 0.0, (double)solver->order() * 1.2);
   solver->factor(data.data());
   solver->enableStats(false);
-  int64_t denseLumps = solver->skel().numLumps() - (solver->sparseEliminationRanges().empty()
-                                                        ? 0
-                                                        : solver->sparseEliminationRanges().back());
+  int64_t denseLumps =
+      solver->skel().numLumps() -
+      (solver->sparseEliminationRanges().empty() ? 0 : solver->sparseEliminationRanges().back());
   EXPECT_EQ((int64_t)s.potrf.size(), denseLumps);
   EXPECT_EQ(s.asmbl.size(), s.syge.size());
   for (size_t i = 0; i < s.asmbl.size(); i++) {

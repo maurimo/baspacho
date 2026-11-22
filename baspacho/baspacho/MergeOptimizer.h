@@ -39,9 +39,8 @@ struct MergeOptimizer {
 
   // `colBoards[a]`: boards of column a, by row node (`Board::c` = row node), in order
   MergeOptimizer(const ComputationModel& model, std::vector<int64_t> parent,
-                 std::vector<int64_t> size, std::vector<int64_t> rows,
-                 std::vector<bool> canMerge, std::vector<bool> sparse,
-                 const std::vector<std::vector<Board>>& colBoards);
+                 std::vector<int64_t> size, std::vector<int64_t> rows, std::vector<bool> canMerge,
+                 std::vector<bool> sparse, const std::vector<std::vector<Board>>& colBoards);
 
   // current lump of node a
   int64_t root(int64_t a);
@@ -64,7 +63,6 @@ struct MergeOptimizer {
   double asmbl(double br, double bc, double m, double mFull) const {
     return model.asmblEst(br, bc) + model.asmblElemEst(m, mFull);
   }
-
 
   const ComputationModel& model;
   int64_t numNodes;

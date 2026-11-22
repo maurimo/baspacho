@@ -16,16 +16,16 @@
 
 #include <algorithm>
 #include <array>
-#include <cmath>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <string>
-#include <memory>
 #include <typeindex>
 #include <unordered_map>
 #include "baspacho/baspacho/ComputationModel.h"
@@ -280,8 +280,8 @@ static Problem makeGenerated(const string& spec) {
     int64_t numCells = dim == 3 ? cells * cells * cells : cells * cells;
     vector<vector<int64_t>> bucket(numCells);
     for (int64_t i = 0; i < N; i++)
-      bucket[key(cellOf(pts[i][0]), cellOf(pts[i][1]), dim == 3 ? cellOf(pts[i][2]) : 0)]
-          .push_back(i);
+      bucket[key(cellOf(pts[i][0]), cellOf(pts[i][1]), dim == 3 ? cellOf(pts[i][2]) : 0)].push_back(
+          i);
     for (int64_t i = 0; i < N; i++) {
       int64_t cx = cellOf(pts[i][0]), cy = cellOf(pts[i][1]), cz = dim == 3 ? cellOf(pts[i][2]) : 0;
       vector<pair<double, int64_t>> cand;
@@ -345,8 +345,9 @@ static Problem makeGenerated(const string& spec) {
     vector<int64_t> targets;  // nodes repeated by degree
     for (int64_t i = 0; i < N; i++) {
       for (int64_t e = 0; e < m && i > 0; e++) {
-        int64_t j = targets.empty() ? 0 : targets[uniform_int_distribution<int64_t>(
-                                              0, targets.size() - 1)(gen)];
+        int64_t j = targets.empty()
+                        ? 0
+                        : targets[uniform_int_distribution<int64_t>(0, targets.size() - 1)(gen)];
         if (j == i) continue;
         pairs.emplace_back(i, j);
         targets.push_back(j);
@@ -445,9 +446,9 @@ struct Opts {
   vector<string> models;  // -model: estimate the factor time with computation models
   vector<string> modes = {"exact", "fast"};  // -modes: analyses compared by -model
   int deepIters = 0;                         // -deepIters: Settings::deepSearchIterations
-  string cm;              // -cm: computation model of the analysis in factor runs
-  string analysis;        // -analysis exact|fast|deep (default: auto)
-  string collect;         // -collect file: append the timings of the factor operations
+  string cm;        // -cm: computation model of the analysis in factor runs
+  string analysis;  // -analysis exact|fast|deep (default: auto)
+  string collect;   // -collect file: append the timings of the factor operations
 };
 
 static uint64_t hashVec(uint64_t h, const vector<int64_t>& v) {
@@ -535,10 +536,11 @@ static void runModels(const Problem& p, const Opts& o) {
         tCreate = min(tCreate, tdelta(hrc::now() - t0).count());
       }
       auto [tFactor, tSparse] = modelledFactorTime(*solver, *model);
-      printf(" %s: analysis=%9.4fs factor(model)=%9.4fs sparse(model)=%9.4fs nnzL=%lld "
-             "lumps=%lld |",
-             mode.c_str(), tCreate, tFactor, tSparse, (long long)solver->dataSize(),
-             (long long)solver->skel().numLumps());
+      printf(
+          " %s: analysis=%9.4fs factor(model)=%9.4fs sparse(model)=%9.4fs nnzL=%lld "
+          "lumps=%lld |",
+          mode.c_str(), tCreate, tFactor, tSparse, (long long)solver->dataSize(),
+          (long long)solver->skel().numLumps());
     }
     printf("\n");
     fflush(stdout);
@@ -582,12 +584,13 @@ static bool runBackend(const Problem& p, const Opts& o, BackendType backend, con
   }
   solver->enableStats(false);
   if (o.createOnly) {
-    printf("%-28s %-8s create(cold)=%9.4fs create=%9.4fs nnzL=%lld lumps=%lld skelHash=%016llx "
-           "flops=%.4g\n",
-           p.name.c_str(), label.c_str(), tCreate[0],
-           minOf(vector<double>(tCreate.begin() + 1, tCreate.end())),
-           (long long)solver->dataSize(), (long long)solver->skel().numLumps(),
-           (unsigned long long)skelHash(*solver), factorFlops(solver->skel()));
+    printf(
+        "%-28s %-8s create(cold)=%9.4fs create=%9.4fs nnzL=%lld lumps=%lld skelHash=%016llx "
+        "flops=%.4g\n",
+        p.name.c_str(), label.c_str(), tCreate[0],
+        minOf(vector<double>(tCreate.begin() + 1, tCreate.end())), (long long)solver->dataSize(),
+        (long long)solver->skel().numLumps(), (unsigned long long)skelHash(*solver),
+        factorFlops(solver->skel()));
     return true;
   }
 
@@ -712,22 +715,27 @@ static int run(int argc, char* argv[]) {
     else if (a == "-g2o") g2o = next();
     else if (a == "-mtx") mtx = next();
     else if (a == "-grid3d") gridN = stoi(next()), gridBs = stoi(next());
-    else if (a == "-gen") genSpec = next();
+    else if (a == "-gen")
+      genSpec = next();
     else if (a == "-modes") {
       stringstream ms(next());
       string m;
       o.modes.clear();
       while (getline(ms, m, ',')) o.modes.push_back(m);
-    } else if (a == "-deepIters") o.deepIters = stoi(next());
-    else if (a == "-cm") o.cm = next();
-    else if (a == "-analysis") o.analysis = next();
-    else if (a == "-collect") o.collect = next();
+    } else if (a == "-deepIters")
+      o.deepIters = stoi(next());
+    else if (a == "-cm")
+      o.cm = next();
+    else if (a == "-analysis")
+      o.analysis = next();
+    else if (a == "-collect")
+      o.collect = next();
     else if (a == "-model") {
       stringstream ms(next());
       string m;
       while (getline(ms, m, ',')) o.models.push_back(m);
-    }
-    else if (a == "-name") name = next();
+    } else if (a == "-name")
+      name = next();
     else if (a == "-reps") o.reps = stoi(next());
     else if (a == "-t") o.numThreads = stoi(next());
     else if (a == "-cuda") o.cuda = true;
@@ -752,7 +760,8 @@ static int run(int argc, char* argv[]) {
   else if (!g2o.empty()) p = loadG2o(g2o), p.name = g2o;
   else if (!mtx.empty()) p = loadMtx(mtx, maxbs), p.name = mtx;
   else if (gridN > 0) p = makeGrid3d(gridN, gridBs);
-  else if (!genSpec.empty()) p = makeGenerated(genSpec);
+  else if (!genSpec.empty())
+    p = makeGenerated(genSpec);
   else {
     help();
     return 1;

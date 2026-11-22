@@ -139,10 +139,9 @@ TEST(MergeOptimizer, FactorTimeEstimate) {
       solver->estimatedFactorTime(ComputationModel::model_Metal_CI_paravirtual);
   double sum = est.opTime[0] + est.opTime[1] + est.opTime[2] + est.opTime[3];
   EXPECT_NEAR(sum, est.supernodal, 1e-12 * sum);
-  int64_t denseLumps = solver->skel().numLumps() -
-                       (solver->sparseEliminationRanges().empty()
-                            ? 0
-                            : solver->sparseEliminationRanges().back());
+  int64_t denseLumps =
+      solver->skel().numLumps() -
+      (solver->sparseEliminationRanges().empty() ? 0 : solver->sparseEliminationRanges().back());
   EXPECT_EQ(est.opCount[0], denseLumps);
   EXPECT_EQ(est.opCount[2], est.opCount[3]);
 }

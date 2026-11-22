@@ -276,88 +276,87 @@ SparseStructure SparseStructure::addIndependentEliminationFill(int64_t elimStart
   // each call processes a few chunks, the work arrays are allocated once per call
   int64_t chunksPerCall = std::max<int64_t>(1, numChunks / (4 * analysisThreads()));
   analysisParallelFor(0L, numChunks, chunksPerCall, [&](int64_t c0, int64_t c1) {
-        vector<int64_t> tags(numRows, -1);
-        vector<int64_t> high, low;
-        for (int64_t c = c0; c < c1; c++) {
-          int64_t kBegin = elimEnd + numRows * c / numChunks;
-          int64_t kEnd = elimEnd + numRows * (c + 1) / numChunks;
-          auto& out = chunkInds[c];
-          for (int64_t k = kBegin; k < kEnd; k++) {
-            size_t rowBegin = out.size();
-            high.clear();
-            tags[k - elimEnd] = k;
-            high.push_back(k);
-            // entries before elimEnd, deduplicated (sorted if needed, ie if not increasing)
-            low.clear();
-            bool increasing = true;
-            for (int64_t q = ptrs[k], qEnd = ptrs[k + 1]; q < qEnd; q++) {
-              int64_t i = inds[q];
-              if (i < elimEnd) {
-                increasing = increasing && (low.empty() || low.back() < i);
-                low.push_back(i);
-              }
-            }
-            if (!increasing) {
-              std::sort(low.begin(), low.end());
-              low.erase(std::unique(low.begin(), low.end()), low.end());
-            }
-            if (bitmap) {
-              out.insert(out.end(), low.begin(), low.end());
-              const uint64_t* row = pairBits.data() + (k - elimEnd) * bitmapWords;
-              for (int64_t wd = 0; wd < bitmapWords; wd++) {
-                for (uint64_t bits = row[wd]; bits; bits &= bits - 1) {
-                  int64_t w = elimEnd + wd * 64 + countTrailingZeros(bits);
-                  tags[w - elimEnd] = k;
-                  high.push_back(w);
-                }
-              }
-            } else if (buckets) {
-              out.insert(out.end(), low.begin(), low.end());
-              for (int64_t q = fillPtr[k - elimEnd], qEnd = fillPtr[k - elimEnd + 1]; q < qEnd;
-                   q++) {
-                int64_t w = fillRows[q] + elimEnd;
-                if (tags[w - elimEnd] != k) {
-                  tags[w - elimEnd] = k;
-                  high.push_back(w);
-                }
-              }
-            }
-            for (int64_t i : (bitmap || buckets) ? std::vector<int64_t>() : low) {
-              out.push_back(i);
-              if (i >= elimStart) {  // walk rows of elim column i, below k
-                for (int64_t t = elimPtrs[i - elimStart], tEnd = elimPtrs[i - elimStart + 1];
-                     t < tEnd; t++) {
-                  int64_t w = elimRows[t];
-                  if (w >= k) {
-                    break;  // sorted
-                  }
-                  if (tags[w - elimEnd] != k) {
-                    tags[w - elimEnd] = k;
-                    high.push_back(w);
-                  }
-                }
-              }
-            }
-            for (int64_t q = ptrs[k], qEnd = ptrs[k + 1]; q < qEnd; q++) {
-              int64_t i = inds[q];
-              if (i > k) {
-                continue;  // upper half entries are ignored (as the diagonal, added above)
-              }
-              if (i >= elimEnd && tags[i - elimEnd] != k) {
-                tags[i - elimEnd] = k;
-                high.push_back(i);
-              }
-            }
-            if (sortIdx) {
-              std::sort(out.begin() + rowBegin, out.end());
-              out.erase(std::unique(out.begin() + rowBegin, out.end()), out.end());
-              std::sort(high.begin(), high.end());
-            }
-            out.insert(out.end(), high.begin(), high.end());
-            rowSize[k - elimEnd] = out.size() - rowBegin;
+    vector<int64_t> tags(numRows, -1);
+    vector<int64_t> high, low;
+    for (int64_t c = c0; c < c1; c++) {
+      int64_t kBegin = elimEnd + numRows * c / numChunks;
+      int64_t kEnd = elimEnd + numRows * (c + 1) / numChunks;
+      auto& out = chunkInds[c];
+      for (int64_t k = kBegin; k < kEnd; k++) {
+        size_t rowBegin = out.size();
+        high.clear();
+        tags[k - elimEnd] = k;
+        high.push_back(k);
+        // entries before elimEnd, deduplicated (sorted if needed, ie if not increasing)
+        low.clear();
+        bool increasing = true;
+        for (int64_t q = ptrs[k], qEnd = ptrs[k + 1]; q < qEnd; q++) {
+          int64_t i = inds[q];
+          if (i < elimEnd) {
+            increasing = increasing && (low.empty() || low.back() < i);
+            low.push_back(i);
           }
         }
-      });
+        if (!increasing) {
+          std::sort(low.begin(), low.end());
+          low.erase(std::unique(low.begin(), low.end()), low.end());
+        }
+        if (bitmap) {
+          out.insert(out.end(), low.begin(), low.end());
+          const uint64_t* row = pairBits.data() + (k - elimEnd) * bitmapWords;
+          for (int64_t wd = 0; wd < bitmapWords; wd++) {
+            for (uint64_t bits = row[wd]; bits; bits &= bits - 1) {
+              int64_t w = elimEnd + wd * 64 + countTrailingZeros(bits);
+              tags[w - elimEnd] = k;
+              high.push_back(w);
+            }
+          }
+        } else if (buckets) {
+          out.insert(out.end(), low.begin(), low.end());
+          for (int64_t q = fillPtr[k - elimEnd], qEnd = fillPtr[k - elimEnd + 1]; q < qEnd; q++) {
+            int64_t w = fillRows[q] + elimEnd;
+            if (tags[w - elimEnd] != k) {
+              tags[w - elimEnd] = k;
+              high.push_back(w);
+            }
+          }
+        }
+        for (int64_t i : (bitmap || buckets) ? std::vector<int64_t>() : low) {
+          out.push_back(i);
+          if (i >= elimStart) {  // walk rows of elim column i, below k
+            for (int64_t t = elimPtrs[i - elimStart], tEnd = elimPtrs[i - elimStart + 1]; t < tEnd;
+                 t++) {
+              int64_t w = elimRows[t];
+              if (w >= k) {
+                break;  // sorted
+              }
+              if (tags[w - elimEnd] != k) {
+                tags[w - elimEnd] = k;
+                high.push_back(w);
+              }
+            }
+          }
+        }
+        for (int64_t q = ptrs[k], qEnd = ptrs[k + 1]; q < qEnd; q++) {
+          int64_t i = inds[q];
+          if (i > k) {
+            continue;  // upper half entries are ignored (as the diagonal, added above)
+          }
+          if (i >= elimEnd && tags[i - elimEnd] != k) {
+            tags[i - elimEnd] = k;
+            high.push_back(i);
+          }
+        }
+        if (sortIdx) {
+          std::sort(out.begin() + rowBegin, out.end());
+          out.erase(std::unique(out.begin() + rowBegin, out.end()), out.end());
+          std::sort(high.begin(), high.end());
+        }
+        out.insert(out.end(), high.begin(), high.end());
+        rowSize[k - elimEnd] = out.size() - rowBegin;
+      }
+    }
+  });
 
   SparseStructure retv;
   retv.ptrs.resize(ord + 1);

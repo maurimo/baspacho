@@ -62,10 +62,11 @@ int main(int argc, char* argv[]) {
   ComputationModel model = fitComputationModel(samples, timeWeighted, outlier, 4, stats);
   const char* names[4] = {"potrf", "trsm", "syge", "asmbl"};
   for (int i = 0; i < 4; i++) {
-    printf("%-6s samples %8lld kept %8lld  median relative error %.3f  "
-           "estimated/measured total %.3f\n",
-           names[i], (long long)stats[i].samples, (long long)stats[i].kept, stats[i].medianRelErr,
-           stats[i].totalRatio);
+    printf(
+        "%-6s samples %8lld kept %8lld  median relative error %.3f  "
+        "estimated/measured total %.3f\n",
+        names[i], (long long)stats[i].samples, (long long)stats[i].kept, stats[i].medianRelErr,
+        stats[i].totalRatio);
   }
   printf("model (ComputationModel.cpp initializer):\n%s\n", formatComputationModel(model).c_str());
   if (!out.empty()) {

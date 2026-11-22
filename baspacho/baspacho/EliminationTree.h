@@ -59,7 +59,7 @@ struct EliminationTree {
   // internal (called by processTree, after buildTreeFast)
   void computeMergesFast();
 
-  bool fastSymbolic = false;  // set by buildTreeFast
+  bool fastSymbolic = false;         // set by buildTreeFast
   bool fundamentalOnly = false;      // computeMergesFast: only merges adding no zeros...
   double fundamentalMaxSize = 1e30;  // ... and only up to this size (scalar columns)
 

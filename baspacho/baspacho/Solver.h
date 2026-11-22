@@ -229,10 +229,10 @@ struct ComputationModel;
  */
 // symbolic analysis, see Settings::analysis
 enum AnalysisMode {
-  AnalysisAuto,   // currently the same as AnalysisFast
-  AnalysisFast,   // column counts, small supernodes, merges optimized with the computation model
-  AnalysisExact,  // (previous analysis) full structure of the factor, greedy merges
-  AnalysisDeep,   // slower, optimizing the merges from several starting points
+  AnalysisAuto,     // currently the same as AnalysisFast
+  AnalysisFast,     // column counts, small supernodes, merges optimized with the computation model
+  AnalysisExact,    // (previous analysis) full structure of the factor, greedy merges
+  AnalysisDeep,     // slower, optimizing the merges from several starting points
   AnalysisRelaxed,  // column counts and relaxed amalgamation only (no computation model)
 };
 

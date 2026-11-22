@@ -878,14 +878,16 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   virtual void trsm(int64_t n, int64_t k, float* data, int64_t offA, int64_t offB) override {
-    gpuTimed(sym.trsmStat, [&] { trsmImpl(n, k, data, offA, offB); }, (int)sizeof(float),
-             (int)n, (int)k);
+    gpuTimed(
+        sym.trsmStat, [&] { trsmImpl(n, k, data, offA, offB); }, (int)sizeof(float), (int)n,
+        (int)k);
   }
 
   virtual void saveSyrkGemm(int64_t m, int64_t n, int64_t k, const float* data,
                             int64_t offset) override {
-    gpuTimed(sym.sygeStat, [&] { saveSyrkGemmImpl(m, n, k, data, offset); }, (int)sizeof(float),
-             (int)m, (int)n, (int)k);
+    gpuTimed(
+        sym.sygeStat, [&] { saveSyrkGemmImpl(m, n, k, data, offset); }, (int)sizeof(float), (int)m,
+        (int)n, (int)k);
   }
 
   virtual void assemble(float* data, int64_t rectRowBegin, int64_t dstStride,
@@ -894,8 +896,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     gpuTimed(
         sym.asmblStat,
         [&] {
-          assembleImpl(data, rectRowBegin, dstStride, srcColDataOffset, srcRectWidth,
-                       numBlockRows, numBlockCols);
+          assembleImpl(data, rectRowBegin, dstStride, srcColDataOffset, srcRectWidth, numBlockRows,
+                       numBlockCols);
         },
         (int)sizeof(float), (int)numBlockRows, (int)numBlockCols);
   }
@@ -999,9 +1001,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     }
   }
 
-  void assembleImpl(float* data, int64_t rectRowBegin, int64_t dstStride,
-                    int64_t srcColDataOffset, int64_t srcRectWidth, int64_t numBlockRows,
-                    int64_t numBlockCols) {
+  void assembleImpl(float* data, int64_t rectRowBegin, int64_t dstStride, int64_t srcColDataOffset,
+                    int64_t srcRectWidth, int64_t numBlockRows, int64_t numBlockCols) {
     @autoreleasepool {
       if (numBlockRows <= 0 || numBlockCols <= 0) return;
 
