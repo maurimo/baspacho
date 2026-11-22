@@ -33,7 +33,7 @@ struct EliminationTree {
 
   // as buildTree, but only computes the elimination tree and the row counts of the columns of L
   // (in O(nnz(A) * alpha), Gilbert-Ng-Peyton), without the structure of L. The merges are then
-  // decided with costs estimated from the row counts (see computeMergesFast)
+  // decided by relaxed amalgamation (see computeMergesFast)
   void buildTreeFast();
 
   // executed the processing
@@ -57,10 +57,6 @@ struct EliminationTree {
 
   // internal (called by processTree, after buildTreeFast)
   void computeMergesFast();
-
-  // estimated time of the factor operations of a node of `size` (made of `merged` spans) with
-  // `rows` rows in `blocks` blocks below the diagonal (blocks assumed of equal size)
-  double estimatedNodeCost(double size, double rows, double blocks, double merged) const;
 
   bool fastSymbolic = false;  // set by buildTreeFast
 

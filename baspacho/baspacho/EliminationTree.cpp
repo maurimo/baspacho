@@ -8,8 +8,6 @@
 #include "baspacho/baspacho/EliminationTree.h"
 #include <algorithm>
 #include <queue>
-#include <sstream>
-#include <string>
 #include <tuple>
 #include "baspacho/baspacho/ComputationModel.h"
 #include "baspacho/baspacho/DebugMacros.h"
@@ -257,21 +255,12 @@ void EliminationTree::buildTreeFast() {
   }
 }
 
-double EliminationTree::estimatedNodeCost(double size, double rows, double blocks,
-                                          double merged) const {
-  // syrk/gemm: for the q-th block from the bottom (rows a = rows / blocks): sygeLinEst(q*a, a)
-  // asmbl: for the q-th block from the bottom, asmblLinEst(q); closed form sums over q = 1..b
-  const auto& sp = compMod.sygeParams;
-  const auto& ap = compMod.asmblParams;
-  double b = blocks, a = blocks > 0 ? rows / blocks : 0.0, tri = b * (b + 1) / 2;
-  double sumMN = a * (tri + b), sumMxN = a * a * tri;
-  double syge0 = b * sp[0] + sumMN * sp[1] + sumMxN * sp[2];
-  double syge1 = b * sp[3] + sumMN * sp[4] + sumMxN * sp[5];
-  double asmbl0 = b * ap[0] + tri * ap[1];
-  double asmbl1 = b * ap[2] + tri * ap[3];
-  return compMod.potrfEst(size) + compMod.trsmEst(size, rows) + syge0 + syge1 * size + asmbl0 +
-         asmbl1 * merged;
-}
+// Relaxed amalgamation (as CHOLMOD's, with larger size thresholds): a child is merged into its
+// parent if no explicit zeros are added, or if the merged node is small enough for its fraction
+// of explicit zeros: sizes (scalar columns) and zero fractions below. Tuned with InitBench on BA,
+// pose graphs, meshes and FEM matrices: same or faster factor than the computation-model merges
+static constexpr double kRelaxSize[3] = {8, 32, 96};
+static constexpr double kRelaxZeros[3] = {0.8, 0.1, 0.05};
 
 void EliminationTree::computeMergesFast() {
   int64_t ord = ss.order();
@@ -279,36 +268,9 @@ void EliminationTree::computeMergesFast() {
   mergeWith.assign(ord, -1);
   numMerges = 0;
 
-  // experiments: BASPACHO_MERGE = cost (default), relax (CHOLMOD-like relaxed amalgamation),
-  // costz (cost, and at most BASPACHO_ZCAP fraction of explicit zeros in the merged node)
-  static const std::string mode = getenv("BASPACHO_MERGE") ? getenv("BASPACHO_MERGE") : "cost";
-  static const double zcap = getenv("BASPACHO_ZCAP") ? atof(getenv("BASPACHO_ZCAP")) : 0.3;
-  // relaxed amalgamation thresholds (CHOLMOD's defaults): sizes n0 < n1 < n2, zero fractions
-  // z0 > z1 > z2: merge if no zeros, or size <= n0, or size <= n1 and zeros < z0, ...
-  static const std::vector<double> rx = [] {
-    std::vector<double> v = {4, 16, 48, 0.8, 0.1, 0.05};
-    if (const char* e = getenv("BASPACHO_RELAX")) {
-      std::stringstream ss(e);
-      std::string t;
-      for (size_t i = 0; i < v.size() && std::getline(ss, t, ','); i++) {
-        v[i] = atof(t.c_str());
-      }
-    }
-    return v;
-  }();
-  vector<double> zeros(ord, 0.0);  // explicit zeros in the (merged) node
-  auto mergedZeros = [&](int64_t k, int64_t p) {
-    // the columns of k get the rows of p (and its diagonal block) they don't have
-    double sk = nodeSize[k], sp = nodeSize[p];
-    double added = sk * std::max(0.0, (double)(nodeRows[p] + sp - nodeRows[k]));
-    return zeros[k] + zeros[p] + added;
-  };
-  auto zeroFraction = [&](int64_t k, int64_t p, double z) {
-    double sm = nodeSize[k] + nodeSize[p];
-    double tot = sm * (sm + 1) / 2 + sm * nodeRows[p];
-    return z / tot;
-  };
-
+  // explicit zeros of the (merged) nodes: merging k into p, the columns of k get the rows of p
+  // (and its diagonal block) they don't have
+  vector<double> zeros(ord, 0.0);
   auto pickUpScore = [&](int64_t k, int64_t p) -> double {
     return ((double)nodeRows[k]) / (nodeRows[p] + nodeSize[p]);
   };
@@ -328,32 +290,12 @@ void EliminationTree::computeMergesFast() {
       mergeCandidates.emplace(pickUpScore(k, p), k, p);
       continue;
     }
-    double z = mergedZeros(k, p);
-    bool willMerge;
-    auto relaxed = [&] {
-      double sm = nodeSize[k] + nodeSize[p], frac = zeroFraction(k, p, z);
-      return z == 0 || sm <= rx[0] || (sm <= rx[1] && frac < rx[3]) ||
-             (sm <= rx[2] && frac < rx[4]) || frac < rx[5];
-    };
-    if (mode == "relax") {
-      willMerge = relaxed();
-    } else if (mode == "relaxcost") {  // relaxed, or faster by the cost model (zeros < zcap)
-      double tk =
-          estimatedNodeCost(nodeSize[k], nodeRows[k], nodeRowBlocks[k], numMergedNodes[k]);
-      double tp =
-          estimatedNodeCost(nodeSize[p], nodeRows[p], nodeRowBlocks[p], numMergedNodes[p]);
-      double tm = estimatedNodeCost(nodeSize[p] + nodeSize[k], nodeRows[p], nodeRowBlocks[p],
-                                    numMergedNodes[p] + numMergedNodes[k]);
-      willMerge = relaxed() || (tm < tk + tp && zeroFraction(k, p, z) < zcap);
-    } else {
-      double tk =
-          estimatedNodeCost(nodeSize[k], nodeRows[k], nodeRowBlocks[k], numMergedNodes[k]);
-      double tp =
-          estimatedNodeCost(nodeSize[p], nodeRows[p], nodeRowBlocks[p], numMergedNodes[p]);
-      double tm = estimatedNodeCost(nodeSize[p] + nodeSize[k], nodeRows[p], nodeRowBlocks[p],
-                                    numMergedNodes[p] + numMergedNodes[k]);
-      willMerge = tm < tk + tp && (mode != "costz" || zeroFraction(k, p, z) < zcap);
-    }
+    double sk = nodeSize[k], sp = nodeSize[p], sm = sk + sp;
+    double z = zeros[k] + zeros[p] + sk * std::max(0.0, (double)(nodeRows[p] + sp - nodeRows[k]));
+    double frac = z / (sm * (sm + 1) / 2 + sm * nodeRows[p]);
+    bool willMerge = z == 0 || sm <= kRelaxSize[0] ||
+                     (sm <= kRelaxSize[1] && frac < kRelaxZeros[0]) ||
+                     (sm <= kRelaxSize[2] && frac < kRelaxZeros[1]) || frac < kRelaxZeros[2];
     if (willMerge) {
       zeros[p] = z;
       mergeWith[k] = p;

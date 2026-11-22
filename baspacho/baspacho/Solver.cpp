@@ -883,12 +883,10 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   // compute as ordinary elimination tree on br-corner
   EliminationTree et(sortedBottomParamSize, sortedSsBottom, compModel);
   timer.mark("etInit");
-  // experiments: BASPACHO_ET=exact uses the (slower) exact structure of L for the merges
-  static const bool exactEt = getenv("BASPACHO_ET") && std::string(getenv("BASPACHO_ET")) == "exact";
-  if (exactEt) {
-    et.buildTree();
-  } else {
+  if (settings.fastAnalysis) {
     et.buildTreeFast();
+  } else {
+    et.buildTree();
   }
   timer.mark("etBuild");
   et.processTree(settings.findSparseEliminationRanges, noCrossPoints,

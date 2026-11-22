@@ -7,8 +7,6 @@
 
 #include "baspacho/baspacho/AnalysisParallel.h"
 #include "baspacho/baspacho/SparseStructure.h"
-#include <cstdlib>
-#include <string>
 
 #ifdef BASPACHO_USE_SUITESPARSE_AMD
 #include <amd.h>
@@ -432,66 +430,9 @@ std::vector<int64_t> SparseStructure::fillReducingPermutation() const {
 
 #else
 
-#ifdef BASPACHO_CHOLMOD_ORDERING
-}  // namespace BaSpaCho
-#include <amd.h>
-#include <cholmod.h>
-namespace BaSpaCho {
-// experiments: orderings from SuiteSparse (BASPACHO_ORDER = ssamd, metis, nesdis), P[k] = index
-// of the k-th node; ss is the lower half by rows, ie the upper half by columns (stype = 1)
-static bool cholmodOrdering(const SparseStructure& ss, std::vector<int64_t>& P) {
-  static const std::string order = getenv("BASPACHO_ORDER") ? getenv("BASPACHO_ORDER") : "";
-  if (order.empty() || order == "amd") {
-    return false;
-  }
-  int64_t n = ss.order();
-  P.resize(n);
-  if (order == "ssamd") {
-    double Control[AMD_CONTROL], Info[AMD_INFO];
-    amd_l_defaults(Control);
-    BASPACHO_CHECK_EQ(amd_l_order(n, ss.ptrs.data(), ss.inds.data(), P.data(), Control, Info),
-                      AMD_OK);
-    return true;
-  }
-  cholmod_common c;
-  cholmod_l_start(&c);
-  cholmod_sparse A = {};
-  A.nrow = A.ncol = n;
-  A.nzmax = ss.inds.size();
-  A.p = (void*)ss.ptrs.data();
-  A.i = (void*)ss.inds.data();
-  A.stype = 1;
-  A.itype = CHOLMOD_LONG;
-  A.xtype = CHOLMOD_PATTERN;
-  A.dtype = CHOLMOD_DOUBLE;
-  A.sorted = 1;
-  A.packed = 1;
-  int ok;
-  if (order == "metis") {
-    ok = cholmod_l_metis(&A, nullptr, 0, /* postorder = */ 1, P.data(), &c);
-  } else if (order == "nesdis") {
-    std::vector<int64_t> cParent(n), cMember(n);
-    ok = cholmod_l_nested_dissection(&A, nullptr, 0, P.data(), cParent.data(), cMember.data(),
-                                     &c) >= 0;
-  } else {
-    throw std::runtime_error("unknown BASPACHO_ORDER " + order);
-  }
-  cholmod_l_finish(&c);
-  BASPACHO_CHECK(ok);
-  return true;
-}
-#endif
-
 std::vector<int64_t> SparseStructure::fillReducingPermutation() const {
   using INT = int;
-#ifdef BASPACHO_CHOLMOD_ORDERING
-  {
-    std::vector<int64_t> P;
-    if (cholmodOrdering(*this, P)) {
-      return P;
-    }
-  }
-#endif
+
   std::vector<INT> colPtr(ptrs.begin(), ptrs.end()), rowInd(inds.begin(), inds.end());
 
   using namespace Eigen;

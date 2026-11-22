@@ -229,6 +229,12 @@ struct Settings {
   BackendType backend = BackendFast;
   AddFillPolicy addFillPolicy = AddFillComplete;
   const ComputationModel* computationModel = nullptr;
+  // Symbolic analysis: if true (default) the supernodes are found from the elimination tree and
+  // the column counts of the factor, in O(nnz(A)), merging nodes by relaxed amalgamation (bounded
+  // fraction of explicit zeros). If false, the full structure of the factor is computed and nodes
+  // are merged when faster according to `computationModel`: much slower on large problems, and
+  // usually not faster to factor
+  bool fastAnalysis = true;
 };
 
 /**
