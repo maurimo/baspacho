@@ -493,11 +493,12 @@ static bool runBackend(const Problem& p, const Opts& o, BackendType backend, con
   }
   solver->enableStats(false);
   if (o.createOnly) {
-    printf("%-28s %-8s create(cold)=%9.4fs create=%9.4fs nnzL=%lld lumps=%lld skelHash=%016llx\n",
+    printf("%-28s %-8s create(cold)=%9.4fs create=%9.4fs nnzL=%lld lumps=%lld skelHash=%016llx "
+           "flops=%.4g\n",
            p.name.c_str(), label.c_str(), tCreate[0],
            minOf(vector<double>(tCreate.begin() + 1, tCreate.end())),
            (long long)solver->dataSize(), (long long)solver->skel().numLumps(),
-           (unsigned long long)skelHash(*solver));
+           (unsigned long long)skelHash(*solver), factorFlops(solver->skel()));
     return true;
   }
 
