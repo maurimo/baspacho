@@ -261,6 +261,14 @@ struct Settings {
   // depending on the shapes of the operations) exceed the gains, see the research notes.
   AnalysisMode analysis = AnalysisAuto;
   int deepSearchIterations = 0;
+  // Elimination order of the parameters after the sparse elimination ranges, used instead of the
+  // fill-reducing (AMD) order when non-empty (ignored by AddFillForGivenElims and AddFillNone,
+  // which do not reorder): entry k is the parameter
+  // eliminated k-th, counted from the end of the ranges (a permutation of 0..n-1, n the number
+  // of those parameters). For problems whose structure is known a priori, as a band from a
+  // trajectory ordered in time. The elimination tree may still reorder within the order's
+  // freedom (a postorder, which adds no fill), and `elimLastIds` still go last.
+  std::vector<int64_t> bottomPermutation;
 };
 
 /**

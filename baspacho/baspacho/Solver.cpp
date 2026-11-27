@@ -850,8 +850,21 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   SparseStructure ssBottom = ss.extractRightBottom(givenSparseElimEnd);
   timer.mark("extractBR");
 
-  // find best permutation for right-bottom corner that is left
-  vector<int64_t> permutation = ssBottom.fillReducingPermutation();
+  // find best permutation for right-bottom corner that is left (or take the given one)
+  vector<int64_t> permutation;
+  if (settings.bottomPermutation.empty()) {
+    permutation = ssBottom.fillReducingPermutation();
+  } else {
+    permutation = settings.bottomPermutation;
+    BASPACHO_CHECK_EQ((int64_t)permutation.size(), ssBottom.order());
+    vector<char> seen(permutation.size(), 0);
+    for (int64_t p : permutation) {
+      BASPACHO_CHECK_GE(p, 0);
+      BASPACHO_CHECK_LT(p, (int64_t)permutation.size());
+      BASPACHO_CHECK(!seen[p]);
+      seen[p] = 1;
+    }
+  }
   timer.mark("amd");
   vector<int64_t> noCrossPoints;
   if (!elimLastIds.empty()) {  // force those params to go last
